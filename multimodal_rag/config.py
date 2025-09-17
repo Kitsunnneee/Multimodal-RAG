@@ -10,11 +10,15 @@ load_dotenv()
 BASE_DIR = Path(__file__).parent.parent
 DATA_DIR = BASE_DIR / "data"
 MODEL_CACHE_DIR = BASE_DIR / ".cache"
+VECTOR_STORE_DIR = BASE_DIR / "vector_store"
 
-# Google Cloud Configuration
-PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "your-project-id")
+# Storage Configuration
+USE_GCS = os.getenv("USE_GCS", "false").lower() == "true"
+
+# Google Cloud Configuration (only used if USE_GCS is True)
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "")
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-GCS_BUCKET = os.getenv("GCS_BUCKET", "your-bucket-name")
+GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 
 # Model Configuration
 MODEL_NAME = "gemini-2.0-flash"
@@ -34,7 +38,7 @@ NEW_AFTER_N_CHARS = 3800
 COMBINE_TEXT_UNDER_N_CHARS = 2000
 
 # Ensure directories exist
-for directory in [DATA_DIR, MODEL_CACHE_DIR]:
+for directory in [DATA_DIR, MODEL_CACHE_DIR, VECTOR_STORE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
 
 class ConfigError(Exception):
@@ -43,18 +47,20 @@ class ConfigError(Exception):
 
 def validate_config():
     """Validate that all required configuration is set."""
-    required_vars = ["GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT"]
-    missing = [var for var in required_vars if not os.getenv(var)]
-    
-    if missing:
-        raise ConfigError(
-            f"Missing required environment variables: {', '.join(missing)}\n"
-            "Please set these in your .env file or environment variables."
-        )
+    if USE_GCS:
+        required_vars = ["GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT"]
+        missing = [var for var in required_vars if not os.getenv(var)]
+        
+        if missing:
+            raise ConfigError(
+                f"GCS is enabled but missing required environment variables: {', '.join(missing)}. "
+                "Please set these variables in your .env file or set USE_GCS=false to use local storage."
+            )
 
 # Validate configuration on import
 try:
     validate_config()
 except ConfigError as e:
-    import warnings
-    warnings.warn(str(e))
+    print(f"Warning: {e} Some features may not work correctly.")
+    if not USE_GCS:
+        print("Continuing with local storage...")
