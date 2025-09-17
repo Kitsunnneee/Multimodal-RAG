@@ -70,24 +70,15 @@ class MultimodalRAG:
             endpoint_id=endpoint_id if self.use_gcs else None,
         )
         
-        # Initialize language model
-        if self.use_gcs:
-            self.llm = ChatVertexAI(
+
+        self.llm = ChatVertexAI(
                 model_name=self.model_name,
                 project=self.project_id,
                 location=self.location,
                 max_output_tokens=self.token_limit,
                 temperature=0.0,
             )
-        else:
-            # For local development, we'll use a simple LLM from langchain
-            # Note: You might want to replace this with a local LLM or another provider
-            from langchain_community.llms import OpenAI
-            self.llm = OpenAI(
-                model_name="gpt-3.5-turbo-instruct",  # or any other model you prefer
-                temperature=0.0,
-                max_tokens=self.token_limit,
-            )
+
         
         # Create the RAG chain
         self._create_rag_chain()
