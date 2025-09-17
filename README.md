@@ -80,22 +80,24 @@ GCS_BUCKET=your-bucket-name
 ## Project Structure
 
 ```
-multimodal-rag/
-├── multimodal_rag/           # Main package
-│   ├── __init__.py
-│   ├── config.py            # Configuration settings
-│   ├── document_processor.py # Document processing utilities
-│   ├── embeddings.py         # Embedding generation
-│   ├── models.py            # Data models
-│   ├── rag_system.py        # Main RAG system implementation
-│   └── utils.py             # Utility functions
-├── data/                    # Sample data directory
-├── tests/                   # Test files
-├── .env.example             # Example environment variables
-├── .gitignore
-├── LICENSE
-├── README.md
-└── requirements.txt
+multimodal_rag/
+├── examples/                  # Example usage scripts and notebooks
+│   └── example_usage.py       # Demo script showing how to use the RAG system
+│
+├── multimodal_rag/           # Main package source code
+│   ├── __init__.py           # Package initialization
+│   ├── cli.py                # Command-line interface
+│   ├── config.py             # Configuration settings and environment variables
+│   ├── document_processor.py # Handles document parsing and processing
+│   ├── embeddings.py         # Manages text embeddings (local and cloud)
+│   ├── rag_system.py         # Core RAG system implementation
+│   └── utils.py              # Utility functions
+│
+├── .env.example              # Template for environment variables
+├── .gitignore               # Specifies intentionally untracked files
+├── README.md                # Project documentation
+├── requirements.txt         # Python dependencies
+└── setup.py                # Package installation script
 ```
 
 ## License
