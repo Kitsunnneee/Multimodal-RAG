@@ -30,69 +30,185 @@ class DocumentProcessor:
         self.output_dir = Path(output_dir) if output_dir else DATA_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
     
-    def process_pdf(
+    def process_file(
         self,
         file_path: Union[str, Path],
         extract_images: bool = True,
         infer_table_structure: bool = True,
     ) -> Dict[str, List[Document]]:
-        """Process a PDF file and extract text, tables, and images.
+        """Process a file (PDF or image) and extract text and images.
         
         Args:
-            file_path: Path to the PDF file
-            extract_images: Whether to extract images from the PDF
-            infer_table_structure: Whether to infer table structure
+            file_path: Path to the file (PDF or image)
+            extract_images: Whether to extract images from the file (for PDFs)
+            infer_table_structure: Whether to infer table structure (for PDFs)
             
         Returns:
-            Dictionary containing 'texts' and 'tables' as lists of Documents
+            Dictionary containing 'texts', 'tables', and 'images' as lists of Documents
+            
+        Raises:
+            FileNotFoundError: If the input file doesn't exist
+            ValueError: If the file type is not supported
+            Exception: For any other processing errors
         """
         file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
         
-        # Extract elements from PDF
-        elements = partition_pdf(
-            filename=str(file_path),
-            extract_images_in_pdf=extract_images,
-            infer_table_structure=infer_table_structure,
-            chunking_strategy="by_title",
-            max_characters=MAX_CHARACTERS,
-            new_after_n_chars=NEW_AFTER_N_CHARS,
-            combine_text_under_n_chars=COMBINE_TEXT_UNDER_N_CHARS,
-            image_output_dir_path=str(self.output_dir),
-        )
+        # Process based on file type
+        file_ext = file_path.suffix.lower()
         
-        # Categorize elements
-        texts = []
-        tables = []
+        if file_ext == '.pdf':
+            return self._process_pdf(file_path, extract_images, infer_table_structure)
+        elif file_ext in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif']:
+            return self._process_image(file_path)
+        else:
+            raise ValueError(f"Unsupported file type: {file_ext}. Supported types: .pdf, .png, .jpg, .jpeg, .tiff, .bmp, .gif")
+    
+    def _process_image(self, file_path: Path) -> Dict[str, List[Document]]:
+        """Process an image file and extract text.
         
-        for element in elements:
-            element_str = str(element)
-            if "unstructured.documents.elements.Table" in str(type(element)):
-                tables.append(element_str)
-            elif "unstructured.documents.elements.CompositeElement" in str(type(element)):
-                texts.append(element_str)
+        Args:
+            file_path: Path to the image file
+            
+        Returns:
+            Dictionary containing 'texts' and empty 'tables' and 'images' lists
+        """
+        from .utils import encode_image, extract_text_from_image
+        import os
         
-        # Convert to Documents
-        text_docs = [Document(page_content=text) for text in texts]
-        table_docs = [Document(page_content=table) for table in tables]
+        try:
+            # Encode image to base64
+            b64_image = encode_image(file_path)
+            
+            # Get the service account path from environment or use default location
+            service_account_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+            if not service_account_path or not os.path.exists(service_account_path):
+                service_account_path = os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)), 
+                    'elite-thunder-461308-f7-cc85c56bb209.json'
+                )
+            
+            if not os.path.exists(service_account_path):
+                raise FileNotFoundError(
+                    f"Service account file not found at {service_account_path}. "
+                    "Please set the GOOGLE_APPLICATION_CREDENTIALS environment variable "
+                    "to point to your service account JSON file."
+                )
+            
+            # Extract text using OCR with Gemini API
+            extracted_text = extract_text_from_image(
+                b64_image,
+                service_account_path=service_account_path
+            )
+            
+            if not extracted_text:
+                print(f"Warning: No text could be extracted from {file_path}")
+                return {"texts": [], "tables": [], "images": []}
+            
+            # Store the image path instead of raw bytes
+            # The actual embedding will be done in the EmbeddingManager
+            doc = Document(
+                page_content=extracted_text,
+                metadata={
+                    "source": str(file_path),
+                    "page": 0,
+                    "type": "image",
+                    "original_content": extracted_text,
+                    "image_path": str(file_path)  # Store path to image file instead of raw bytes
+                }
+            )
+            
+            return {"texts": [doc], "tables": [], "images": [doc]}
+            
+        except Exception as e:
+            print(f"Error processing image {file_path}: {e}")
+            # Return empty results on error
+            return {"texts": [], "tables": [], "images": []}
+    
+    def _process_pdf(
+        self,
+        file_path: Path,
+        extract_images: bool = True,
+        infer_table_structure: bool = True,
+    ) -> Dict[str, List[Document]]:
+        """Process a PDF file and extract text, tables, and images."""
+        from unstructured.partition.pdf import partition_pdf
+        from .config import MAX_CHARACTERS, NEW_AFTER_N_CHARS, COMBINE_TEXT_UNDER_N_CHARS
         
-        # Process images if any were extracted
-        image_docs = []
-        if extract_images:
-            image_files = list(self.output_dir.glob("*.png")) + list(self.output_dir.glob("*.jpg"))
-            for img_path in image_files:
+        try:
+            # Ensure output directory exists
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Extract elements from PDF with error handling
+            try:
+                elements = partition_pdf(
+                    filename=str(file_path),
+                    extract_images_in_pdf=extract_images,
+                    infer_table_structure=infer_table_structure,
+                    chunking_strategy="by_title",
+                    max_characters=MAX_CHARACTERS,
+                    new_after_n_chars=NEW_AFTER_N_CHARS,
+                    combine_text_under_n_chars=COMBINE_TEXT_UNDER_N_CHARS,
+                    image_output_dir_path=str(self.output_dir),
+                )
+            except Exception as e:
+                raise ValueError(f"Failed to process PDF: {str(e)}") from e
+            
+            # Categorize elements with type checking
+            texts = []
+            tables = []
+            
+            for element in elements:
                 try:
-                    b64_image = encode_image(img_path)
-                    image_docs.append(Document(page_content=b64_image, metadata={"source": str(img_path.name)}))
+                    element_str = str(element or '').strip()
+                    if not element_str:
+                        continue
+                        
+                    element_type = str(type(element))
+                    if "Table" in element_type:
+                        tables.append(element_str)
+                    elif any(t in element_type for t in ["CompositeElement", "Text"]):
+                        texts.append(element_str)
                 except Exception as e:
-                    print(f"Error processing image {img_path}: {e}")
-        
-        return {
-            "texts": text_docs,
-            "tables": table_docs,
-            "images": image_docs,
-        }
+                    print(f"Warning: Error processing element: {e}")
+                    continue
+            
+            # Convert to Documents with content validation
+            text_docs = [Document(page_content=text) for text in texts if text and len(text) > 10]
+            table_docs = [Document(page_content=table) for table in tables if table]
+            
+            # Process images if any were extracted
+            image_docs = []
+            if extract_images:
+                image_files = list(self.output_dir.glob("*.png")) + list(self.output_dir.glob("*.jpg"))
+                for img_path in image_files:
+                    try:
+                        if img_path.stat().st_size == 0:
+                            continue
+                        b64_image = encode_image(img_path)
+                        if b64_image and len(b64_image) > 100:  # Basic validation
+                            image_docs.append(Document(
+                                page_content=b64_image, 
+                                metadata={"source": str(img_path.name)}
+                            ))
+                        # Clean up the image file after processing
+                        img_path.unlink(missing_ok=True)
+                    except Exception as e:
+                        print(f"Warning: Error processing image {img_path}: {e}")
+                        continue
+            
+            return {
+                "texts": text_docs,
+                "tables": table_docs,
+                "images": image_docs,
+            }
+            
+        except Exception as e:
+            # Clean up any temporary files on error
+            if 'elements' in locals():
+                del elements
+            raise Exception(f"Error processing PDF {file_path.name}: {str(e)}") from e
     
     def chunk_documents(
         self,

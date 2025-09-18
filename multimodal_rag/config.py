@@ -23,12 +23,22 @@ GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 # Model Configuration
 MODEL_NAME = "gemini-2.0-flash"
 EMBEDDING_MODEL_NAME = "text-embedding-005"
+MULTIMODAL_EMBEDDING_MODEL = "multimodalembedding"
 TOKEN_LIMIT = 8192  # Max tokens for Gemini model
 
 # Vector Search Configuration
 VECTOR_SEARCH_INDEX_NAME = "mm_rag_langchain_index"
 DEPLOYED_INDEX_ID = "mm_rag_langchain_index_endpoint"
 DIMENSIONS = 768  # Dimensions for text-embedding-005
+MULTIMODAL_DIMENSIONS = 1408  # Dimensions for multimodal embeddings
+
+# Vertex AI Configuration
+VERTEX_AI_LOCATION = os.getenv("VERTEX_AI_LOCATION", "us-central1")
+VERTEX_AI_PROJECT = os.getenv("VERTEX_AI_PROJECT", PROJECT_ID)
+VERTEX_AI_ENDPOINT = os.getenv(
+    "VERTEX_AI_ENDPOINT",
+    f"projects/{VERTEX_AI_PROJECT}/locations/{VERTEX_AI_LOCATION}/publishers/google/models/{MULTIMODAL_EMBEDDING_MODEL}"
+)
 
 # Document Processing
 CHUNK_SIZE = 4000

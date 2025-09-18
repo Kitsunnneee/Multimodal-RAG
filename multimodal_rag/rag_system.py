@@ -231,7 +231,7 @@ class MultimodalRAG:
             self.initialize()
         
         # Process the document
-        elements = self.document_processor.process_pdf(file_path)
+        elements = self.document_processor.process_file(file_path)
         
         # Generate summaries for text and tables
         text_summaries = []
