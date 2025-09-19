@@ -1,4 +1,6 @@
 """Main RAG system implementation for multimodal retrieval and generation."""
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from langchain_core.documents import Document
@@ -54,34 +56,59 @@ class MultimodalRAG:
         """Initialize the RAG system components.
         
         Args:
-            index_id: Optional custom index ID
-            endpoint_id: Optional custom endpoint ID
+            index_id: Optional custom index ID (only used with GCS)
+            endpoint_id: Optional custom endpoint ID (only used with GCS)
         """
-        # Initialize embedding manager
-        self.embedding_manager = EmbeddingManager(
-            project_id=self.project_id,
-            location=self.location,
-            use_gcs=self.use_gcs,
-        )
+        print("Initializing embedding manager...")
+        # Initialize embedding manager with appropriate model
+        try:
+            self.embedding_manager = EmbeddingManager(
+                api_key=os.getenv('GOOGLE_API_KEY'),
+                model_name="text-embedding-004",  # Use the correct embedding model
+                use_vision=False  # We'll handle vision separately
+            )
+            
+            # Initialize vector store based on storage type
+            if self.use_gcs:
+                print("Initializing GCS vector store...")
+                # Initialize vector store with existing index and endpoint for GCS
+                self.embedding_manager.initialize_vector_store(
+                    project_id=self.project_id,
+                    location=self.location,
+                    index_id=index_id,
+                    endpoint_id=endpoint_id
+                )
+            else:
+                print("Initializing local vector store...")
+                # Initialize local vector store
+                self.embedding_manager.initialize_vector_store(
+                    persist_directory=str(Path(__file__).parent.parent / "data" / "vector_store")
+                )
+                
+            print("Vector store initialized successfully")
+            
+        except Exception as e:
+            print(f"Error initializing embedding manager: {e}")
+            raise
         
-        # Initialize vector store with existing index and endpoint
-        self.embedding_manager.initialize_vector_store(
-            index_id=index_id if self.use_gcs else None,
-            endpoint_id=endpoint_id if self.use_gcs else None,
-        )
-        
-
-        self.llm = ChatVertexAI(
+        # Initialize the LLM
+        try:
+            print(f"Initializing LLM with model: {self.model_name}")
+            self.llm = ChatVertexAI(
                 model_name=self.model_name,
                 project=self.project_id,
                 location=self.location,
                 max_output_tokens=self.token_limit,
                 temperature=0.0,
             )
-
+        except Exception as e:
+            print(f"Error initializing LLM: {e}")
+            raise
         
         # Create the RAG chain
+        print("Creating RAG chain...")
         self._create_rag_chain()
+        print("RAG system initialization complete")
     
     def _create_rag_chain(self) -> None:
         """Create the RAG chain with prompt template and model."""
@@ -141,15 +168,51 @@ class MultimodalRAG:
         messages = [
             ("system", "You are a helpful assistant that answers questions based on the provided context."),
             *chat_history,
-            ("human", f"Context:\n{full_context}\n\nQuestion: {question}"),
+        ]
+        
+        # Create the human message with text content
+        human_message = [
+            ("human", f"Context:\n{full_context}\n\nQuestion: {question}")
         ]
         
         # Add images if any
         if context["images"]:
-            messages[-1][1].extend([
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img}"}}
-                for img in context["images"]
-            ])
+            # Convert the human message to a list of message parts
+            message_parts = [{"type": "text", "text": f"Context:\n{full_context}\n\nQuestion: {question}"}]
+            
+            # Add image parts
+            for img_doc in context["images"]:
+                # Handle both Document objects and direct base64 strings
+                if hasattr(img_doc, 'metadata') and 'image_data' in img_doc.metadata:
+                    img_data = img_doc.metadata['image_data']
+                elif isinstance(img_doc, str):
+                    img_data = img_doc
+                else:
+                    print("Skipping invalid image format in context")
+                    continue
+                
+                # Clean up the image data if needed
+                if img_data.startswith('data:image/'):
+                    img_data = img_data.split(',', 1)[-1]
+                
+                # Add the image part
+                try:
+                    message_parts.append({
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{img_data}"}
+                    })
+                except Exception as e:
+                    print(f"Error adding image to message: {e}")
+            
+            # Only update the message if we have valid image parts
+            if len(message_parts) > 1:  # More than just the text part
+                human_message = [("human", message_parts)]
+            else:
+                # Fallback to text-only if no valid images were added
+                human_message = [("human", f"Context:\n{full_context}\n\nQuestion: {question}")]
+        
+        # Add the human message to the messages list
+        messages.extend(human_message)
         
         return messages
     
@@ -245,9 +308,8 @@ class MultimodalRAG:
         # Generate summaries for images
         image_summaries = []
         if elements["images"]:
-            image_summaries = self._generate_image_summaries(
-                [doc.page_content for doc in elements["images"]]
-            )
+            # Pass the full document objects to access metadata
+            image_summaries = self._generate_image_summaries(elements["images"])
         
         # Combine all documents and summaries
         all_docs = elements["texts"] + elements["tables"] + elements["images"]
@@ -272,9 +334,16 @@ class MultimodalRAG:
         from .document_processor import generate_summaries
         return generate_summaries(texts, model_name=self.model_name)
     
-    def _generate_image_summaries(self, b64_images: List[str]) -> List[str]:
-        """Generate summaries for a list of base64-encoded images."""
-        if not b64_images:
+    def _generate_image_summaries(self, image_docs: List[Union[Document, str]]) -> List[str]:
+        """Generate summaries for a list of image documents.
+        
+        Args:
+            image_docs: List of Document objects containing image data in metadata
+            
+        Returns:
+            List of image summaries
+        """
+        if not image_docs:
             return []
         
         # Create a temporary LLM for image summarization
@@ -288,19 +357,68 @@ class MultimodalRAG:
         
         # Generate summaries
         summaries = []
-        for img in b64_images:
+        for doc in image_docs:
             try:
-                response = llm.invoke([
-                    HumanMessage(
-                        content=[
-                            {"type": "text", "text": "Describe this image in detail for retrieval."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img}"}},
-                        ]
-                    )
-                ])
+                # Get image data from document metadata
+                if not hasattr(doc, 'metadata') or 'image_data' not in doc.metadata:
+                    print("Document missing image data in metadata")
+                    summaries.append("Image data not found")
+                    continue
+                
+                img_data = doc.metadata['image_data']
+                
+                # Handle case where image data is already base64 encoded
+                if not isinstance(img_data, str):
+                    print("Image data is not a string, skipping...")
+                    summaries.append("Invalid image data")
+                    continue
+                
+                # Clean up the base64 string
+                img_data = img_data.strip()
+                
+                # Remove data URL prefix if present
+                if img_data.startswith('data:image/'):
+                    img_data = img_data.split(',', 1)[-1]
+                
+                # Remove any non-base64 characters
+                import re
+                img_data = re.sub(r'[^a-zA-Z0-9+/=]', '', img_data)
+                
+                # Ensure proper length (must be multiple of 4)
+                padding = len(img_data) % 4
+                if padding:
+                    img_data += '=' * (4 - padding)
+                
+                # Try to validate base64
+                import base64
+                try:
+                    # Decode and re-encode to ensure valid base64
+                    decoded = base64.b64decode(img_data, validate=True)
+                    # Use the re-encoded version to ensure consistency
+                    img_data = base64.b64encode(decoded).decode('ascii')
+                except Exception as e:
+                    print(f"Invalid base64 image data: {str(e)[:100]}")
+                    print(f"Image data length: {len(img_data)}")
+                    print(f"First 50 chars: {img_data[:50]}...")
+                    summaries.append("Invalid image data")
+                    continue
+                
+                # Create the message with proper formatting
+                message = HumanMessage(
+                    content=[
+                        {"type": "text", "text": "Describe this image in detail for retrieval."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_data}"}},
+                    ]
+                )
+                
+                # Get the response
+                response = llm.invoke([message])
                 summaries.append(response.content)
+                
             except Exception as e:
-                print(f"Error generating summary for image: {e}")
-                summaries.append("Image content")
-        
+                import traceback
+                print(f"Error generating summary for image: {str(e)}")
+                print(traceback.format_exc())
+                summaries.append("Image description not available")
+                
         return summaries

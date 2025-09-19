@@ -114,15 +114,41 @@ def test_retrieval(rag) -> None:
         query = "What is this document about?"
         print(f"\nTesting retrieval with query: '{query}'")
         
+        # First, test direct document retrieval
+        if hasattr(rag, 'embedding_manager') and hasattr(rag.embedding_manager, 'get_relevant_documents'):
+            try:
+                print("\nTesting direct document retrieval...")
+                docs = rag.embedding_manager.get_relevant_documents(query, k=2)
+                if not docs:
+                    print("⚠️ No documents retrieved")
+                else:
+                    print(f"Retrieved {len(docs)} documents:")
+                    for i, doc in enumerate(docs):
+                        content = getattr(doc, 'page_content', str(doc))
+                        if len(content) > 200:
+                            content = content[:200] + "..."
+                        print(f"{i+1}. {content}")
+            except Exception as e:
+                print(f"⚠️ Direct document retrieval failed: {e}")
+        
+        # Then test the full RAG query
+        print("\nTesting RAG query...")
         response = rag.query(query, return_context=True)
         
         # Print response
         print("\nResponse:")
-        print(response.get("answer", "No answer found"))
+        answer = response.get("answer")
+        if not answer:
+            print("No answer found in response")
+            print(f"Full response: {response}")
+        else:
+            print(answer)
         
         # Check context
         context = response.get("context", {})
-        if context:
+        if not context:
+            print("⚠️ No context found in response")
+        else:
             print("\nContext used:")
             for doc_type, docs in context.items():
                 if not isinstance(docs, (list, tuple)):
@@ -151,9 +177,12 @@ def test_retrieval(rag) -> None:
             specific_query = "What are the main topics discussed?"
             print(f"Query: '{specific_query}'")
             
-            specific_response = rag.query(specific_query, return_context=False)
-            print("\nResponse:")
-            print(specific_response.get("answer", "No answer found"))
+            try:
+                specific_response = rag.query(specific_query, return_context=False)
+                print("\nResponse:")
+                print(specific_response.get("answer", "No answer found"))
+            except Exception as e:
+                print(f"⚠️ Specific query failed: {e}")
         
         print("✅ Retrieval test completed")
         

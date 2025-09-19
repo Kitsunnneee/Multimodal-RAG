@@ -106,16 +106,16 @@ class DocumentProcessor:
                 print(f"Warning: No text could be extracted from {file_path}")
                 return {"texts": [], "tables": [], "images": []}
             
-            # Store the image path instead of raw bytes
-            # The actual embedding will be done in the EmbeddingManager
+            # Store the base64-encoded image in the document content
+            # along with the extracted text for better retrieval
             doc = Document(
-                page_content=extracted_text,
+                page_content=f"[IMAGE] {extracted_text}",
                 metadata={
                     "source": str(file_path),
                     "page": 0,
                     "type": "image",
                     "original_content": extracted_text,
-                    "image_path": str(file_path)  # Store path to image file instead of raw bytes
+                    "image_data": b64_image  # Store the base64-encoded image data
                 }
             )
             

@@ -97,34 +97,53 @@ def split_image_text_types(docs: List[Union[Document, str, dict]]) -> Dict[str, 
         docs: List of Document objects, strings, or dictionaries with 'page_content' and 'type' keys
         
     Returns:
-        Dictionary with 'images' and 'texts' keys
+        Dictionary with 'images' and 'texts' keys containing the original documents
     """
-    b64_images = []
+    images = []
     texts = []
     
     for doc in docs:
-        # Handle different input types
-        if isinstance(doc, Document):
-            content = doc.page_content
-            doc_type = doc.metadata.get('type', 'text') if hasattr(doc, 'metadata') else 'text'
-        elif isinstance(doc, dict):
-            content = doc.get('page_content', '') if 'page_content' in doc else str(doc)
-            doc_type = doc.get('type', 'text')
-        else:
-            content = str(doc)
-            doc_type = 'text'
-        
-        # Skip empty content
-        if not content:
+        # Skip None or empty documents
+        if not doc:
             continue
             
-        # Check if content is an image (either by type or by content analysis)
-        if doc_type == 'image' or (is_base64(content) and is_image_data(content)):
-            b64_images.append(content)
-        else:
-            texts.append(content)
+        # Handle different input types
+        if isinstance(doc, Document):
+            metadata = getattr(doc, 'metadata', {})
+            doc_type = metadata.get('type', 'text')
             
-    return {"images": b64_images, "texts": texts}
+            # Check if this is an image document with image_data in metadata
+            if doc_type == 'image' and 'image_data' in metadata:
+                images.append(doc)
+                continue
+                
+            # Check if content is base64-encoded image data
+            content = doc.page_content
+            if is_base64(content) and is_image_data(content):
+                images.append(doc)
+                continue
+                
+            # Otherwise treat as text
+            if content:  # Only add non-empty content
+                texts.append(doc)
+                
+        elif isinstance(doc, dict):
+            # Handle dictionary input
+            if 'type' in doc and doc['type'] == 'image' and 'image_data' in doc:
+                images.append(doc)
+            elif 'page_content' in doc and doc['page_content']:
+                texts.append(doc)
+            elif doc:  # Non-empty dict without page_content
+                texts.append(doc)
+                
+        elif isinstance(doc, str) and doc.strip():
+            # Handle string input
+            if is_base64(doc) and is_image_data(doc):
+                images.append(doc)
+            else:
+                texts.append(doc)
+            
+    return {"images": images, "texts": texts}
 
 
 def display_image(b64_string: str) -> None:
