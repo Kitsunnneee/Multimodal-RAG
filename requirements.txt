@@ -1,0 +1,40 @@
+# Core Dependencies
+langchain>=0.1.0
+langchain-google-vertexai>=0.0.7
+langchain-community>=0.0.10
+python-dotenv>=1.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+pypdf>=3.15.0
+python-multipart>=0.0.6
+fastapi>=0.95.0
+uvicorn>=0.22.0
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+python-multipart>=0.0.6
+pytest>=7.3.1
+pytest-cov>=4.0.0
+black>=23.3.0
+isort>=5.12.0
+flake8>=6.0.0
+mypy>=1.0.0
+types-requests>=2.28.11.7
+types-python-dateutil>=2.8.19.7
+
+# Google Cloud
+google-cloud-aiplatform>=1.25.0
+google-cloud-storage>=2.10.0
+
+# Image Processing
+Pillow>=10.0.0
+opencv-python-headless>=4.7.0
+
+# Document Processing
+pytesseract>=0.3.10
+python-docx>=0.8.11
+python-pptx>=0.6.21
+openpyxl>=3.1.2
+
+# Optional: For Jupyter notebook support
+jupyter>=1.0.0
+ipykernel>=6.0.0
