@@ -159,51 +159,73 @@ def test_similarity_functions():
     assert results[0][0] == 0, "Most similar should be first"
     assert results[0][1] > results[1][1], "Scores should be in descending order"
 
-def test_embedding_manager():
-    """Test the EmbeddingManager class with multimodal documents."""
-    from multimodal_rag.embeddings import EmbeddingManager
-    from langchain_core.documents import Document
+def test_embedding_manager(use_llama_parse=False):
+    """Test the EmbeddingManager class with multimodal documents.
     
-    try:
-        manager = EmbeddingManager(use_gcs=False)
-        
-        # Create a test image
-        img = create_test_image()
-        img_byte_arr = img.tobytes()
-        
-        # Test with text and image documents
-        documents = [
-            Document(
-                page_content="A document with an image",
-                metadata={"image_data": img_byte_arr}
-            ),
-            Document(page_content="A text-only document")
-        ]
-        
-        doc_ids = manager.add_documents(documents)
-        assert isinstance(doc_ids, list), "Should return a list of document IDs"
-        assert len(doc_ids) == 2, "Should return one ID per document"
-        
-        # Test similarity search with text
-        results = manager.similarity_search("test content", k=1)
-        assert isinstance(results, list), "Should return a list of results"
-        
-        # Test with filter
-        results = manager.similarity_search(
-            "test", 
-            k=2, 
-            filter_dict={"page_content": {"$regex": "image"}}
-        )
-        assert len(results) == 1, "Should return only documents matching the filter"
-        
-    except Exception as e:
-        print(f"Error in test_embedding_manager: {e}")
-        raise
+    Args:
+        use_llama_parse: Whether to use LlamaParse for document processing
+    """
+    from multimodal_rag.embeddings import EmbeddingManager
+    from multimodal_rag.config import VECTOR_STORE_DIR, LLAMA_CLOUD_API_KEY
+    from multimodal_rag.document_processor import DocumentProcessor
+    
+    # Check if LlamaParse is available
+    if use_llama_parse and not LLAMA_CLOUD_API_KEY:
+        print("Warning: LLAMA_CLOUD_API_KEY not set. LlamaParse will not be available.")
+        print("Set LLAMA_CLOUD_API_KEY environment variable to use LlamaParse.")
+        print("Falling back to default parser.")
+        use_llama_parse = False
+    
+    # Create test documents
+    text_doc = {"text": TEST_TEXT, "type": "text"}
+    image_doc = {"image_path": str(test_image_path), "type": "image"}
+    
+    # Initialize embedding manager with document processor
+    doc_processor = DocumentProcessor(use_llama_parse=use_llama_parse)
+    manager = EmbeddingManager(
+        vector_store_dir=VECTOR_STORE_DIR,
+        collection_name="test_embeddings",
+        document_processor=doc_processor
+    )
+    
+    # Test adding documents
+    print(f"\n[Test 6/6] Testing document embedding with {'LlamaParse' if use_llama_parse else 'default parser'}...")
+    doc_ids = manager.add_documents([text_doc, image_doc])
+    assert len(doc_ids) == 2, "Should return two document IDs"
+    print(f"Added documents with IDs: {doc_ids}")
+    
+    # Test similarity search
+    results = manager.similarity_search(TEST_TEXT, k=1)
+    assert results, "Should return at least one similar document"
+    print("Similarity search successful")
+    
+    # Test getting document by ID
+    doc = manager.get_document(doc_ids[0])
+    assert doc, "Should retrieve document by ID"
+    print("Document retrieval by ID successful")
+    
+    # Clean up
+    manager.delete_collection()
+    print("Test collection cleaned up")
 
 if __name__ == "__main__":
+    import argparse
+    
     # Create test data directory if it doesn't exist
     os.makedirs("test_data", exist_ok=True)
     
+    parser = argparse.ArgumentParser(description="Test embeddings with or without LlamaParse")
+    parser.add_argument("--llama-parse", action="store_true", 
+                      help="Use LlamaParse for document processing")
+    
+    args = parser.parse_args()
+    
     # Run tests
-    import pytest
-    sys.exit(pytest.main(["-v", __file__]))
+    test_vertex_ai_initialization()
+    test_text_embeddings()
+    test_image_embeddings()
+    test_video_embeddings()
+    test_similarity_functions()
+    
+    # Run embedding manager test with specified parser
+    test_embedding_manager(use_llama_parse=args.llama_parse)

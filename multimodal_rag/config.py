@@ -47,6 +47,13 @@ MAX_CHARACTERS = 4000
 NEW_AFTER_N_CHARS = 3800
 COMBINE_TEXT_UNDER_N_CHARS = 2000
 
+# LlamaParse Configuration
+LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY", "")
+LLAMA_PARSE_RESULT_TYPE = "markdown"  # or "text"
+LLAMA_PARSE_NUM_WORKERS = 4
+LLAMA_PARSE_VERBOSE = True
+LLAMA_PARSE_TIMEOUT = 300  # seconds
+
 # Ensure directories exist
 for directory in [DATA_DIR, MODEL_CACHE_DIR, VECTOR_STORE_DIR]:
     directory.mkdir(parents=True, exist_ok=True)
@@ -57,15 +64,21 @@ class ConfigError(Exception):
 
 def validate_config():
     """Validate that all required configuration is set."""
-    if USE_GCS:
-        required_vars = ["GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_CLOUD_PROJECT"]
-        missing = [var for var in required_vars if not os.getenv(var)]
-        
-        if missing:
-            raise ConfigError(
-                f"GCS is enabled but missing required environment variables: {', '.join(missing)}. "
-                "Please set these variables in your .env file or set USE_GCS=false to use local storage."
-            )
+    if USE_GCS and not all([PROJECT_ID, GCS_BUCKET]):
+        raise ConfigError(
+            "Google Cloud Storage is enabled but required configuration is missing. "
+            "Please set GOOGLE_CLOUD_PROJECT and GCS_BUCKET environment variables."
+        )
+    
+    if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS") and USE_GCS:
+        raise ConfigError(
+            "GOOGLE_APPLICATION_CREDENTIALS environment variable is required when using GCS."
+        )
+    
+    # Check LlamaParse API key if using LlamaParse
+    if os.getenv("USE_LLAMA_PARSE", "false").lower() == "true" and not LLAMA_CLOUD_API_KEY:
+        print("Warning: LLAMA_CLOUD_API_KEY environment variable is not set. "
+              "LlamaParse will not be available.")
 
 # Validate configuration on import
 try:

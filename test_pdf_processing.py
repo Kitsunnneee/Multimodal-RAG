@@ -19,15 +19,32 @@ def create_test_image(output_path: Path, size=(200, 200), text="Test"):
     img.save(output_path)
     return output_path
 
-def test_pdf_processing(pdf_path):
-    """Test PDF processing with the given PDF file."""
-    print(f"\n{'='*50}\nTesting PDF: {pdf_path}\n{'='*50}")
+def test_pdf_processing(pdf_path, use_llama_parse=False):
+    """Test PDF processing with the given PDF file.
+    
+    Args:
+        pdf_path: Path to the PDF file to test
+        use_llama_parse: Whether to use LlamaParse for document processing
+    """
+    print(f"\n{'='*50}\nTesting PDF: {pdf_path}\nParser: {'LlamaParse' if use_llama_parse else 'Default'}\n{'='*50}")
     
     # Import here to catch any import errors
     try:
         from multimodal_rag.document_processor import DocumentProcessor
         from multimodal_rag.embeddings import LocalEmbeddings, EmbeddingManager
-        from multimodal_rag.config import DATA_DIR, VECTOR_STORE_DIR
+        from multimodal_rag.config import (
+            DATA_DIR, 
+            VECTOR_STORE_DIR,
+            LLAMA_CLOUD_API_KEY
+        )
+        
+        # Check if LlamaParse is available
+        if use_llama_parse and not LLAMA_CLOUD_API_KEY:
+            print("Warning: LLAMA_CLOUD_API_KEY not set. LlamaParse will not be available.")
+            print("Set LLAMA_CLOUD_API_KEY environment variable to use LlamaParse.")
+            print("Falling back to default parser.")
+            use_llama_parse = False
+            
     except ImportError as e:
         print(f"Error importing required modules: {e}")
         print("Please make sure you have installed all dependencies from requirements.txt")
@@ -42,8 +59,11 @@ def test_pdf_processing(pdf_path):
     if not test_image_path.exists():
         create_test_image(test_image_path, text="Test Image for Embedding")
     
-    # Initialize processor and embeddings
-    processor = DocumentProcessor(output_dir=test_output_dir)
+    # Initialize processor with or without LlamaParse
+    processor = DocumentProcessor(
+        output_dir=test_output_dir,
+        use_llama_parse=use_llama_parse
+    )
     
     try:
         # Test 1: Process the PDF
@@ -141,13 +161,36 @@ def test_pdf_processing(pdf_path):
         return None
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python test_pdf_processing.py <path_to_pdf>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Test PDF processing with or without LlamaParse")
+    parser.add_argument("pdf_path", help="Path to the PDF file to process")
+    parser.add_argument("--llama-parse", action="store_true", 
+                      help="Use LlamaParse for document processing")
     
-    pdf_path = Path(sys.argv[1])
+    args = parser.parse_args()
+    
+    pdf_path = Path(args.pdf_path)
     if not pdf_path.exists():
         print(f"Error: File not found: {pdf_path}")
         sys.exit(1)
     
-    test_pdf_processing(pdf_path)
+    # Run test with both parsers if no specific parser is selected
+    if not args.llama_parse:
+        print("\n" + "="*70)
+        print("RUNNING WITH DEFAULT PARSER")
+        print("="*70)
+        test_pdf_processing(pdf_path, use_llama_parse=False)
+        
+        # Only run LlamaParse test if API key is available
+        try:
+            from multimodal_rag.config import LLAMA_CLOUD_API_KEY
+            if LLAMA_CLOUD_API_KEY:
+                print("\n" + "="*70)
+                print("RUNNING WITH LLAMAPARSE")
+                print("="*70)
+                test_pdf_processing(pdf_path, use_llama_parse=True)
+            else:
+                print("\nSkipping LlamaParse test: LLAMA_CLOUD_API_KEY not set")
+        except ImportError:
+            print("\nSkipping LlamaParse test: Could not import config")
+    else:
+        test_pdf_processing(pdf_path, use_llama_parse=True)

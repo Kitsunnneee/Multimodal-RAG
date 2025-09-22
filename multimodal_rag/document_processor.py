@@ -1,11 +1,13 @@
 """Document processing utilities for the Multimodal RAG system."""
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
 
 from langchain_core.documents import Document
 from langchain_text_splitters import CharacterTextSplitter
 from unstructured.partition.pdf import partition_pdf
+
+from .llama_parse_loader import LlamaParseLoader
 
 from .config import (
     CHUNK_SIZE,
@@ -21,20 +23,45 @@ from .utils import encode_image, is_image_data, split_image_text_types
 class DocumentProcessor:
     """Process documents and extract text, tables, and images."""
     
-    def __init__(self, output_dir: Optional[Union[str, Path]] = None):
+    def __init__(
+        self, 
+        output_dir: Optional[Union[str, Path]] = None,
+        use_llama_parse: bool = True,
+        llama_parse_kwargs: Optional[Dict[str, Any]] = None,
+    ):
         """Initialize the document processor.
         
         Args:
             output_dir: Directory to save extracted images. If None, uses DATA_DIR.
+            use_llama_parse: Whether to use LlamaParse for document parsing
+            llama_parse_kwargs: Additional arguments to pass to LlamaParse
         """
         self.output_dir = Path(output_dir) if output_dir else DATA_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize LlamaParse if enabled and API key is available
+        self.use_llama_parse = use_llama_parse
+        self.llama_loader = None
+        
+        if use_llama_parse:
+            try:
+                self.llama_loader = LlamaParseLoader(
+                    output_dir=self.output_dir,
+                    **(llama_parse_kwargs or {})
+                )
+                print("LlamaParse initialized successfully")
+            except Exception as e:
+                print(f"Warning: Failed to initialize LlamaParse: {e}")
+                print("Falling back to default parser")
+                self.use_llama_parse = False
     
     def process_file(
         self,
         file_path: Union[str, Path],
         extract_images: bool = True,
         infer_table_structure: bool = True,
+        use_llama_parse: Optional[bool] = None,
+        **kwargs,
     ) -> Dict[str, List[Document]]:
         """Process a file (PDF or image) and extract text and images.
         
@@ -42,6 +69,8 @@ class DocumentProcessor:
             file_path: Path to the file (PDF or image)
             extract_images: Whether to extract images from the file (for PDFs)
             infer_table_structure: Whether to infer table structure (for PDFs)
+            use_llama_parse: Override for using LlamaParse. If None, uses class default.
+            **kwargs: Additional arguments to pass to the loader
             
         Returns:
             Dictionary containing 'texts', 'tables', and 'images' as lists of Documents
@@ -49,21 +78,44 @@ class DocumentProcessor:
         Raises:
             FileNotFoundError: If the input file doesn't exist
             ValueError: If the file type is not supported
-            Exception: For any other processing errors
         """
         file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
         
-        # Process based on file type
-        file_ext = file_path.suffix.lower()
+        file_type = file_path.suffix.lower()  # Keep the dot for consistency
         
-        if file_ext == '.pdf':
-            return self._process_pdf(file_path, extract_images, infer_table_structure)
-        elif file_ext in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif']:
+        # Initialize result dictionary
+        result = {
+            "texts": [],
+            "tables": [],
+            "images": []
+        }
+        
+        # Use LlamaParse if enabled and available for this file type
+        use_llama = use_llama_parse if use_llama_parse is not None else self.use_llama_parse
+        if use_llama and self.llama_loader and file_type in ['.pdf', '.docx', '.pptx', '.xlsx']:
+            try:
+                # Remove the dot for the file_type parameter since LlamaParse expects it without dot
+                documents = self.llama_loader.load_file(file_path, file_type=file_type.lstrip('.'), **kwargs)
+                result["texts"] = documents
+                return result
+            except Exception as e:
+                print(f"Warning: LlamaParse failed with error: {e}. Falling back to default parser.")
+                if use_llama_parse:  # Only if explicitly requested, otherwise just warn
+                    raise
+        
+        # Process the file based on its type
+        if file_type == '.pdf':
+            return self._process_pdf(
+                file_path, 
+                extract_images=kwargs.get('extract_images', True),
+                infer_table_structure=kwargs.get('infer_table_structure', True)
+            )
+        elif file_type in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif']:
             return self._process_image(file_path)
         else:
-            raise ValueError(f"Unsupported file type: {file_ext}. Supported types: .pdf, .png, .jpg, .jpeg, .tiff, .bmp, .gif")
+            raise ValueError(f"Unsupported file type: {file_type}. Supported types: .pdf, .png, .jpg, .jpeg, .tiff, .bmp, .gif")
     
     def _process_image(self, file_path: Path) -> Dict[str, List[Document]]:
         """Process an image file and extract text.
@@ -274,7 +326,7 @@ def generate_summaries(
         List of summaries
     """
     from langchain_core.prompts import PromptTemplate
-    from langchain_google_vertexai import VertexAI
+    from langchain_core.output_parsers import StrOutputParser
     
     if not texts:
         return []
@@ -287,11 +339,28 @@ def generate_summaries(
     """
     
     prompt = PromptTemplate.from_template(prompt_template)
-    llm = VertexAI(
-        model_name=model_name,
-        temperature=temperature,
-        max_output_tokens=max_tokens,
-    )
     
-    chain = prompt | llm
-    return chain.batch([{"text": text} for text in texts], {"max_concurrency": 5})
+    try:
+        # First try using VertexAI
+        from langchain_google_vertexai import VertexAI
+        
+        llm = VertexAI(
+            model_name=model_name,
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+        chain = prompt | llm
+        return chain.batch([{"text": text} for text in texts], {"max_concurrency": 5})
+        
+    except Exception as e:
+        print(f"Warning: Could not use VertexAI: {e}")
+        print("Falling back to a simple text truncation for summarization...")
+        
+        # Fallback: Just return the first few sentences as a simple summary
+        def simple_summary(text: str, max_sentences: int = 3) -> str:
+            import re
+            # Split into sentences (very basic)
+            sentences = re.split(r'(?<=[.!?])\s+', text)
+            return ' '.join(sentences[:max_sentences])
+            
+        return [simple_summary(text) for text in texts]

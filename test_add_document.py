@@ -9,14 +9,17 @@ from typing import Dict, Any, List, Optional
 # Add the project root to the path
 sys.path.insert(0, str(Path(__file__).parent))
 
-def test_add_document(pdf_path: str, cleanup: bool = True):
+def test_add_document(pdf_path: str, cleanup: bool = True, use_llama_parse: bool = False):
     """Test adding a document to the RAG system with embedding tests.
     
     Args:
         pdf_path: Path to the PDF file to test
         cleanup: Whether to clean up test artifacts after completion
+        use_llama_parse: Whether to use LlamaParse for document processing
     """
-    print(f"\n{'='*50}\nTesting document addition: {pdf_path}\n{'='*50}")
+    print(f"\n{'='*50}\nTesting document addition: {pdf_path}")
+    print(f"Parser: {'LlamaParse' if use_llama_parse else 'Default'}")
+    print(f"{'='*50}")
     
     # Convert to Path object
     pdf_path = Path(pdf_path)
@@ -27,8 +30,15 @@ def test_add_document(pdf_path: str, cleanup: bool = True):
     try:
         # Import here to catch any import errors
         from multimodal_rag.rag_system import MultimodalRAG
-        from multimodal_rag.config import DATA_DIR, VECTOR_STORE_DIR
+        from multimodal_rag.config import DATA_DIR, VECTOR_STORE_DIR, LLAMA_CLOUD_API_KEY
         from multimodal_rag.embeddings import LocalEmbeddings
+        
+        # Check if LlamaParse is available
+        if use_llama_parse and not LLAMA_CLOUD_API_KEY:
+            print("Warning: LLAMA_CLOUD_API_KEY not set. LlamaParse will not be available.")
+            print("Set LLAMA_CLOUD_API_KEY environment variable to use LlamaParse.")
+            print("Falling back to default parser.")
+            use_llama_parse = False
         
         # Create test output directory
         test_output_dir = DATA_DIR / "test_output"
@@ -43,6 +53,19 @@ def test_add_document(pdf_path: str, cleanup: bool = True):
         print("\n[1/4] Initializing RAG system...")
         rag = MultimodalRAG(use_gcs=False)
         rag.initialize()
+        
+        # Set document processor to use LlamaParse if requested and available
+        if use_llama_parse:
+            try:
+                rag.document_processor = rag.document_processor.__class__(
+                    output_dir=test_output_dir,
+                    use_llama_parse=True
+                )
+                if not rag.document_processor.use_llama_parse:
+                    print("Warning: LlamaParse is not available. Using default parser.")
+            except Exception as e:
+                print(f"Warning: Failed to initialize LlamaParse: {e}")
+                print("Falling back to default parser")
         
         # Test 1: Add the document
         print(f"\n[2/4] Adding document: {pdf_path}")
@@ -205,4 +228,20 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Test document addition with or without LlamaParse")
+    parser.add_argument("pdf_path", help="Path to the PDF file to process")
+    parser.add_argument("--no-cleanup", action="store_false", dest="cleanup",
+                      help="Don't clean up test artifacts after completion")
+    parser.add_argument("--llama-parse", action="store_true", 
+                      help="Use LlamaParse for document processing")
+    
+    args = parser.parse_args()
+    
+    # Run the test with the specified options
+    test_add_document(
+        pdf_path=args.pdf_path,
+        cleanup=args.cleanup,
+        use_llama_parse=args.llama_parse
+    )

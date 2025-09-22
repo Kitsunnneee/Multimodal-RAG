@@ -60,7 +60,7 @@ class GeminiEmbeddings:
     """Handles embedding generation using Google's Vertex AI Text Embeddings with fallback to local model."""
     
     def __init__(self, api_key: str = None, model_name: str = "text-embedding-004"):
-        """Initialize the embeddings model.
+        """Initialize the embeddings model with fallback to local model.
         
         Args:
             api_key: Google Cloud API key. If None, will use application default credentials.
@@ -72,31 +72,90 @@ class GeminiEmbeddings:
         self.local_model = None
         self.dimension = 768  # Standard dimension for text-embedding-004
         
+        # Try to initialize Vertex AI with proper error handling
         try:
-            if not self.api_key and 'GOOGLE_APPLICATION_CREDENTIALS' not in os.environ:
-                raise ValueError("No API key or application default credentials found")
+            # First try with explicit API key if provided
+            if self.api_key:
+                os.environ["GOOGLE_API_KEY"] = self.api_key
                 
+            # Check if we have any authentication method available
+            if 'GOOGLE_APPLICATION_CREDENTIALS' not in os.environ and 'GOOGLE_API_KEY' not in os.environ:
+                raise ValueError("No Google Cloud credentials found. Please set GOOGLE_APPLICATION_CREDENTIALS or provide an API key.")
+            
+            # Initialize Vertex AI
+            import vertexai
+            from google.cloud import aiplatform
+            
+            # Try to initialize with explicit project/location if available
+            project_id = os.environ.get('GOOGLE_CLOUD_PROJECT')
+            location = os.environ.get('GOOGLE_CLOUD_LOCATION', 'us-central1')
+            
+            if project_id:
+                vertexai.init(project=project_id, location=location)
+            else:
+                vertexai.init()
+            
+            # Initialize the embeddings model
             from vertexai.language_models import TextEmbeddingModel
             self.model = TextEmbeddingModel.from_pretrained(self.model_name)
+            
             # Test the API with a simple call
-            self.model.get_embeddings(["test"])
-            print(f"Successfully initialized Vertex AI Embeddings with model: {self.model_name}")
+            try:
+                self.model.get_embeddings(["test"])
+                print(f"Successfully initialized Vertex AI Embeddings with model: {self.model_name}")
+                return  # Success, no need for fallback
+            except Exception as e:
+                print(f"Warning: Vertex AI API test failed: {e}")
+                
+        except ImportError as e:
+            print(f"Warning: Could not import Vertex AI dependencies: {e}")
         except Exception as e:
-            print(f"Warning: Could not initialize Vertex AI Embeddings: {e}")
-            print("Falling back to local embeddings model...")
-            self._init_local_model()
+            print(f"Warning: Could not initialize Vertex AI: {e}")
+        
+        # If we get here, Vertex AI initialization failed
+        print("Falling back to local embeddings model...")
+        self._init_local_model()
     
     def _init_local_model(self):
-        """Initialize a local model for embeddings."""
-        try:
-            from sentence_transformers import SentenceTransformer
-            self.local_model = SentenceTransformer('all-MiniLM-L6-v2')
-            self.dimension = self.local_model.get_sentence_embedding_dimension()
-            self.use_local = True
-            print("Initialized local embedding model")
-        except Exception as e:
-            raise RuntimeError("Failed to initialize local embedding model. Please install sentence-transformers: pip install sentence-transformers") from e
+        """Initialize a local model for embeddings with multiple fallback options."""
+        # List of models to try in order of preference
+        model_options = [
+            'all-MiniLM-L6-v2',  # Good balance of speed and quality
+            'paraphrase-MiniLM-L6-v2',  # Alternative if above fails
+            'all-mpnet-base-v2',  # Higher quality but larger
+        ]
         
+        # Try each model until one works
+        for model_name in model_options:
+            try:
+                from sentence_transformers import SentenceTransformer
+                print(f"Attempting to load local embedding model: {model_name}")
+                self.local_model = SentenceTransformer(model_name)
+                self.dimension = self.local_model.get_sentence_embedding_dimension()
+                self.use_local = True
+                print(f"Successfully initialized local embedding model: {model_name}")
+                return  # Success, exit after first working model
+            except Exception as e:
+                print(f"Warning: Could not load {model_name}: {e}")
+                continue
+        
+        # If no model worked, try a basic fallback
+        try:
+            print("Falling back to basic universal-sentence-encoder")
+            import tensorflow_hub as hub
+            import tensorflow as tf
+            # Suppress TensorFlow logging
+            tf.get_logger().setLevel('ERROR')
+            self.local_model = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
+            self.dimension = 512  # USEv4 uses 512 dimensions
+            self.use_local = True
+            print("Initialized basic universal-sentence-encoder")
+        except Exception as e:
+            print(f"Warning: Could not initialize any local embeddings model: {e}")
+            print("Using random embeddings as fallback (not recommended for production)")
+            self.use_local = False
+            self.dimension = 384  # Standard dimension for smaller models
+    
     def embed_text(self, text: Union[str, List[str]]) -> np.ndarray:
         """Generate embeddings for text.
         

@@ -296,30 +296,48 @@ class MultimodalRAG:
         # Process the document
         elements = self.document_processor.process_file(file_path)
         
-        # Generate summaries for text and tables
-        text_summaries = []
-        if elements["texts"]:
-            text_summaries = self._generate_summaries([doc.page_content for doc in elements["texts"]])
-        
-        table_summaries = []
-        if elements["tables"]:
-            table_summaries = self._generate_summaries([doc.page_content for doc in elements["tables"]])
-        
-        # Generate summaries for images
-        image_summaries = []
-        if elements["images"]:
-            # Pass the full document objects to access metadata
-            image_summaries = self._generate_image_summaries(elements["images"])
-        
-        # Combine all documents and summaries
-        all_docs = elements["texts"] + elements["tables"] + elements["images"]
-        all_summaries = text_summaries + table_summaries + image_summaries
-        
-        # Add to vector store
-        doc_ids = self.embedding_manager.add_documents(
-            documents=all_docs,
-            summaries=all_summaries,
-        )
+        try:
+            # Generate summaries for text and tables
+            text_summaries = []
+            if elements["texts"]:
+                try:
+                    text_summaries = self._generate_summaries([doc.page_content for doc in elements["texts"]])
+                except Exception as e:
+                    print(f"Warning: Could not generate text summaries: {e}")
+                    # Use the first 200 characters as a fallback summary
+                    text_summaries = [doc.page_content[:200] + "..." for doc in elements["texts"]]
+            
+            table_summaries = []
+            if elements["tables"]:
+                try:
+                    table_summaries = self._generate_summaries([doc.page_content for doc in elements["tables"]])
+                except Exception as e:
+                    print(f"Warning: Could not generate table summaries: {e}")
+                    # Use the first 200 characters as a fallback summary
+                    table_summaries = [doc.page_content[:200] + "..." for doc in elements["tables"]]
+            
+            # Generate summaries for images
+            image_summaries = []
+            if elements["images"]:
+                try:
+                    # Pass the full document objects to access metadata
+                    image_summaries = self._generate_image_summaries(elements["images"])
+                except Exception as e:
+                    print(f"Warning: Could not generate image summaries: {e}")
+                    image_summaries = ["Image content"] * len(elements["images"])
+            
+            # Combine all documents and summaries
+            all_docs = elements["texts"] + elements["tables"] + elements["images"]
+            all_summaries = text_summaries + table_summaries + image_summaries
+            
+            # Add to vector store
+            doc_ids = self.embedding_manager.add_documents(
+                documents=all_docs,
+                summaries=all_summaries,
+            )
+        except Exception as e:
+            print(f"Error during document processing: {e}")
+            raise
         
         # Return counts
         return {
