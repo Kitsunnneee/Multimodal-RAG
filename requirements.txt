@@ -1,5 +1,8 @@
 # Core Dependencies
+mem0ai>=0.1.0
 langchain-core>=0.1.0
+vertexai>=1.0.0
+google-cloud-aiplatform>=1.36.0
 langchain-google-vertexai>=0.0.10
 langchain-community>=0.0.10
 langchain-text-splitters>=0.0.1

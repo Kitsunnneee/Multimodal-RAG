@@ -5,6 +5,8 @@ from pathlib import Path
 from pprint import pprint
 import shutil
 from typing import Dict, Any, List, Optional
+import vertexai
+from google.cloud import aiplatform
 
 # Add the project root to the path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -84,8 +86,16 @@ def test_add_document(pdf_path: str, cleanup: bool = True, use_llama_parse: bool
         test_text_embeddings(rag)
         
         # Test 3: Test retrieval
-        print("\n[4/4] Testing retrieval...")
+        print("\n[4/6] Testing retrieval...")
         test_retrieval(rag)
+        
+        # Test 4: Test memory operations
+        print("\n[5/6] Testing memory operations...")
+        test_memory_operations(rag)
+        
+        # Test 5: Test retrieval with memory
+        print("\n[6/6] Testing retrieval with memory...")
+        test_retrieval(rag)  # Run retrieval again to test with added memories
         
         return result
         
@@ -128,6 +138,62 @@ def test_text_embeddings(rag) -> None:
         
     except Exception as e:
         print(f"⚠️ Text embedding test failed: {e}")
+
+
+def test_memory_operations(rag) -> None:
+    """Test Mem0 memory operations."""
+    try:
+        if not hasattr(rag, 'memory_manager'):
+            print("⚠️ No memory manager found, skipping memory tests")
+            return
+            
+        print("\n[Memory Test] Testing Mem0 integration...")
+        
+        # Test adding memory
+        test_memory = "The user is testing the Mem0 memory integration with the RAG system."
+        print(f"Adding test memory: {test_memory}")
+        memory_id = rag.memory_manager.add_memory(
+            content=test_memory,
+            metadata={"test": True, "source": "test_add_document.py"}
+        )
+        print(f"Memory added with ID: {memory_id}")
+        
+        # Test searching memories
+        print("\nSearching for relevant memories...")
+        search_query = "What is being tested?"
+        results = rag.memory_manager.search_memories(search_query, top_k=2)
+        
+        if not results:
+            print("⚠️ No memories found in search")
+        else:
+            print(f"Found {len(results)} relevant memories:")
+            for i, mem in enumerate(results, 1):
+                content = mem['content']
+                score = mem.get('score', 0)
+                print(f"{i}. [{score:.3f}] {content[:100]}...")
+        
+        # Test conversation history
+        print("\nTesting conversation history...")
+        conversation_id = "test_conversation_123"
+        
+        # Add conversation history
+        rag.memory_manager.add_memory(
+            content="User: What is the capital of France?",
+            metadata={"conversation_id": conversation_id, "role": "user"}
+        )
+        rag.memory_manager.add_memory(
+            content="Assistant: The capital of France is Paris.",
+            metadata={"conversation_id": conversation_id, "role": "assistant"}
+        )
+        
+        # Retrieve conversation history
+        history = rag.memory_manager.get_conversation_history(conversation_id)
+        print(f"Retrieved {len(history)} conversation messages")
+        
+        print("✅ Memory operations test completed")
+        
+    except Exception as e:
+        print(f"⚠️ Memory operations test failed: {e}")
 
 
 def test_retrieval(rag) -> None:
