@@ -66,6 +66,21 @@ index/
 # Local development settings
 local_settings.py
 
+# Audio files (for testing)
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+
+# API Keys and credentials
+key.json
+*.json
+
+# Local vector stores
+local_vector_store/
+vector_store/
+
 # Byte-compiled / optimized / DLL files
 *.py[cod]
 *$py.class

@@ -44,13 +44,14 @@ class MemoryManager:
                 }
             },
             "llm": {
-        "provider": "gemini",
-        "config": {
-            "model": "gemini-2.0-flash-001",
-            "temperature": 0.2,
-            "max_tokens": 2000,
-            "top_p": 1.0
-        }
+                # Note: 'gemini' provider uses Vertex AI infrastructure for Gemini models
+                "provider": "gemini",
+                "config": {
+                    "model": "gemini-2.0-flash-001",
+                    "temperature": 0.2,
+                    "max_tokens": 1000,
+                    "top_p": 1.0
+                }
             }
         }
         return config
@@ -132,7 +133,8 @@ class MemoryManager:
             
         except Exception as e:
             logger.error(f"Error adding memory: {str(e)}")
-            raise
+            # Don't raise the exception, just log it to keep the system working
+            return ""
             
     def search_memories(
         self, 
