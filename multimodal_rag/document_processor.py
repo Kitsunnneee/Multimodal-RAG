@@ -3,11 +3,14 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
 
+import pandas as pd
 from langchain_core.documents import Document
 from langchain_text_splitters import CharacterTextSplitter
+from pptx import Presentation
 from unstructured.partition.pdf import partition_pdf
 
 from .llama_parse_loader import LlamaParseLoader
+from .file_utils import get_file_type, is_supported_file
 
 from .config import (
     CHUNK_SIZE,
@@ -262,50 +265,122 @@ class DocumentProcessor:
                 del elements
             raise Exception(f"Error processing PDF {file_path.name}: {str(e)}") from e
     
-    def chunk_documents(
-        self,
-        documents: List[Document],
-        chunk_size: int = CHUNK_SIZE,
-        chunk_overlap: int = CHUNK_OVERLAP,
-    ) -> List[Document]:
-        """Split documents into smaller chunks.
+    def _process_pptx(self, file_path: Union[str, Path], extra_info: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """Extract text from a PowerPoint presentation.
         
         Args:
-            documents: List of Document objects to chunk
-            chunk_size: Maximum size of each chunk
-            chunk_overlap: Number of characters to overlap between chunks
+            file_path: Path to the PowerPoint file
+            extra_info: Additional metadata to include in the documents
             
         Returns:
-            List of chunked Document objects
+            List of Document objects, one per slide
         """
-        if not documents:
-            return []
+        prs = Presentation(file_path)
+        documents = []
+        
+        for i, slide in enumerate(prs.slides):
+            text = []
+            for shape in slide.shapes:
+                if hasattr(shape, "text"):
+                    text.append(shape.text)
             
-        text_splitter = CharacterTextSplitter.from_tiktoken_encoder(
-            chunk_size=chunk_size,
-            chunk_overlap=chunk_overlap,
-        )
+            if text:
+                content = "\n".join(filter(None, text))
+                metadata = {
+                    "source": str(file_path),
+                    "page": i + 1,
+                    "file_type": "pptx",
+                    "total_slides": len(prs.slides),
+                    "slide_number": i + 1,
+                    **(extra_info or {})
+                }
+                documents.append(Document(page_content=content, metadata=metadata))
         
-        # Extract text from documents
-        texts = [doc.page_content for doc in documents]
-        metadatas = [doc.metadata for doc in documents]
+        return documents
+    
+    def _process_xlsx(self, file_path: Union[str, Path], extra_info: Optional[Dict[str, Any]] = None) -> List[Document]:
+        """Extract data from an Excel file.
         
-        # Split the texts
-        chunks = []
-        for i, text in enumerate(texts):
-            chunks.extend(
-                Document(
-                    page_content=chunk,
-                    metadata={
-                        **metadatas[i],
-                        "chunk": j,
-                        "total_chunks": len(text_splitter.split_text(text)),
-                    },
+        Args:
+            file_path: Path to the Excel file
+            extra_info: Additional metadata to include in the documents
+            
+        Returns:
+            List of Document objects, one per sheet
+        """
+        xls = pd.ExcelFile(file_path)
+        documents = []
+        
+        for sheet_name in xls.sheet_names:
+            try:
+                df = pd.read_excel(xls, sheet_name=sheet_name)
+                
+                # Convert DataFrame to markdown for better formatting
+                content = f"# {sheet_name}\n\n{df.to_markdown()}"
+                
+                metadata = {
+                    "source": str(file_path),
+                    "file_type": "xlsx",
+                    "sheet_name": sheet_name,
+                    "shape": f"{df.shape[0]} rows x {df.shape[1]} columns",
+                    **(extra_info or {})
+                }
+                documents.append(Document(page_content=content, metadata=metadata))
+            except Exception as e:
+                print(f"Error processing sheet '{sheet_name}': {e}")
+        
+        return documents
+
+    def _process_file(
+        self, 
+        file_path: Union[str, Path],
+        file_type: Optional[str] = None,
+        extra_info: Optional[Dict[str, Any]] = None,
+    ) -> List[Document]:
+        """Process a single file and return a list of documents.
+        
+        Args:
+            file_path: Path to the file to process
+            file_type: Type of the file (pdf, docx, pptx, xlsx, etc.)
+            extra_info: Additional metadata to include in the documents
+            
+        Returns:
+            List of Document objects
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+            
+        # Detect file type if not provided
+        if not file_type:
+            file_type, _ = get_file_type(file_path)
+        
+        # Use LlamaParse if available and not disabled
+        if self.use_llama_parse and self.llama_loader and file_type in ('pdf', 'docx'):
+            try:
+                return self.llama_loader.load_file(
+                    file_path, 
+                    file_type=file_type,
+                    extra_info=extra_info
                 )
-                for j, chunk in enumerate(text_splitter.split_text(text))
-            )
+            except Exception as e:
+                print(f"Error using LlamaParse: {e}. Falling back to local processing.")
+        
+        # Process based on file type
+        if not is_supported_file(file_path):
+            raise ValueError(f"Unsupported file type: {file_type}")
             
-        return chunks
+        if file_type == 'pdf':
+            return self._process_pdf(file_path, extra_info=extra_info)
+        elif file_type == 'docx':
+            return self._process_docx(file_path, extra_info=extra_info)
+        elif file_type == 'pptx':
+            return self._process_pptx(file_path, extra_info=extra_info)
+        elif file_type == 'xlsx':
+            return self._process_xlsx(file_path, extra_info=extra_info)
+        else:
+            # Default to text processing
+            return self._process_text_file(file_path, extra_info=extra_info)
 
 
 def generate_summaries(

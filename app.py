@@ -129,13 +129,49 @@ for message in st.session_state.chat_history:
         
         # Show citations if available
         if message.get("citations"):
-            with st.expander("View Citations"):
-                for i, citation in enumerate(message["citations"]):
-                    st.write(f"**Citation {i+1}**")
-                    if "image" in citation:
-                        st.image(citation["image"])
-                    if "text" in citation:
-                        st.text(citation["text"][:500] + "...")
+            with st.expander(f"📚 Sources ({len(message['citations'])})", expanded=False):
+                for i, citation in enumerate(message["citations"], 1):
+                    with st.container():
+                        st.markdown(f"### Source {i}")
+                        
+                        # Display source information
+                        col1, col2 = st.columns([1, 3])
+                        
+                        with col1:
+                            # Show icon based on source type
+                            if citation.get('type') == 'image':
+                                st.markdown("🖼️ **Image Source**")
+                                if 'image_path' in citation and citation['image_path']:
+                                    try:
+                                        st.image(citation['image_path'], use_column_width=True)
+                                    except Exception as e:
+                                        st.warning("Could not load image")
+                            else:
+                                st.markdown("📄 **Text Source**")
+                        
+                        with col2:
+                            # Display source metadata
+                            st.markdown(f"**{citation.get('display_text', 'Source')}**")
+                            
+                            # Show content preview for text sources
+                            if citation.get('type') == 'text' and 'content' in citation:
+                                with st.expander("View content"):
+                                    st.markdown(citation['content'])
+                            
+                            # Add a download/view button for the source
+                            if 'source' in citation and citation['source']:
+                                source_path = Path(citation['source'])
+                                if source_path.exists():
+                                    with open(source_path, "rb") as f:
+                                        st.download_button(
+                                            label="View Source",
+                                            data=f,
+                                            file_name=source_path.name,
+                                            mime="application/octet-stream",
+                                            use_container_width=True
+                                        )
+                        
+                        st.markdown("---")  # Divider between citations
 
 # Chat input
 if prompt := st.chat_input("Ask a question about your documents..."):
@@ -164,11 +200,29 @@ if prompt := st.chat_input("Ask a question about your documents..."):
                     # Display response
                     st.write(response["answer"])
                     
-                    # Add to chat history
+                    # Format citations for display
+                    formatted_citations = []
+                    for citation in response.get("citations", []):
+                        formatted_citation = {
+                            "type": citation.get("type", "text"),
+                            "display_text": citation.get("display_text", ""),
+                            "source": citation.get("source", ""),
+                            "page": citation.get("page", "")
+                        }
+                        
+                        # Add type-specific fields
+                        if formatted_citation["type"] == "image":
+                            formatted_citation["image_path"] = citation.get("image_path", "")
+                        else:
+                            formatted_citation["content"] = citation.get("content", "")
+                        
+                        formatted_citations.append(formatted_citation)
+                    
+                    # Add to chat history with formatted citations
                     st.session_state.chat_history.append({
                         "role": "assistant",
                         "content": response["answer"],
-                        "citations": response.get("citations", [])
+                        "citations": formatted_citations
                     })
                     
                     # Update memory if enabled
@@ -197,6 +251,24 @@ st.markdown("""
     }
     .stSidebar {
         padding: 2rem 1rem;
+    }
+    /* Style for citations */
+    .citation {
+        background-color: #f8f9fa;
+        border-radius: 0.5rem;
+        padding: 1rem;
+        margin: 0.5rem 0;
+        border-left: 4px solid #4a90e2;
+    }
+    .citation-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 0.5rem;
+    }
+    .citation-content {
+        font-size: 0.9rem;
+        color: #495057;
     }
     .stButton>button {
         width: 100%;

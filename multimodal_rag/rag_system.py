@@ -259,17 +259,54 @@ class MultimodalRAG:
             "chat_history": chat_history or [],
         }
         
-        # Get the answer
+        # Get the answer and context
         answer = self.chain.invoke(input_data)
         
-        # Get the context if requested
-        context = None
-        if return_context:
-            context = self.retrieve_documents(question)
+        # Always retrieve context for citations, but only include in response if requested
+        context = self.retrieve_documents(question)
+        
+        # Prepare citations from context
+        citations = []
+        
+        # Process text documents
+        for doc in context.get('texts', []):
+            if hasattr(doc, 'metadata'):
+                source = doc.metadata.get('source', 'Unknown source')
+                page = doc.metadata.get('page', '')
+                citation_text = f"Source: {Path(source).name}"
+                if page:
+                    citation_text += f", Page: {page}"
+                
+                # Add a snippet of the content
+                content = doc.page_content[:200] + '...' if len(doc.page_content) > 200 else doc.page_content
+                
+                citations.append({
+                    'type': 'text',
+                    'source': source,
+                    'page': page,
+                    'content': content,
+                    'display_text': citation_text
+                })
+        
+        # Process images
+        for doc in context.get('images', []):
+            if hasattr(doc, 'metadata'):
+                source = doc.metadata.get('source', 'Unknown source')
+                citations.append({
+                    'type': 'image',
+                    'source': source,
+                    'image_path': doc.metadata.get('image_path', ''),
+                    'display_text': f"Image from: {Path(source).name}"
+                })
         
         # Prepare response
-        response = {"answer": answer}
-        if context is not None:
+        response = {
+            "answer": answer,
+            "citations": citations
+        }
+        
+        # Include full context if requested
+        if return_context:
             response["context"] = context
         
         return response
