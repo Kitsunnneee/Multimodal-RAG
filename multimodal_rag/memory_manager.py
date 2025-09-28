@@ -3,6 +3,10 @@ from typing import Dict, List, Optional, Any, Callable
 import os
 import logging
 from mem0 import Memory, MemoryClient
+import base64
+from io import BytesIO
+from PIL import Image
+import streamlit as st
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -20,40 +24,45 @@ class MemoryManager:
         """
         self.collection_name = collection_name
         self.use_hosted = use_hosted
-        self.user_id = user_id
+        self.user_id = user_id or "default_user"
         self.client = self._initialize_client()
     
+    def _get_memory_key(self, memory_type: str) -> str:
+        """Generate a unique key for a memory."""
+        return f"{self.collection_name}_{memory_type}"
+    
     def _build_local_config(self) -> Dict[str, Any]:
-        """Build configuration for local Mem0 instance with Google multimodal embedding."""
-        config = {
+        """Build configuration for Mem0 with Qdrant as the vector store."""
+        return {
             "vector_store": {
-                "provider": "faiss",
+                "provider": "qdrant",
                 "config": {
                     "collection_name": self.collection_name,
-                    "path": "./local_vector_store",
-                    "distance_strategy": "cosine"
+                    "host": os.getenv("QDRANT_URL", "localhost"),
+                    "port": int(os.getenv("QDRANT_PORT", "6333")),
+                    "api_key": os.getenv("QDRANT_API_KEY"),
+                    "embedding_model_dims": 768,  # Adjust based on your embedding model
+                    "on_disk": False
                 }
             },
             "embedder": {
-                "provider": "vertexai",
-                "config": {
-                    "model": "text-embedding-004",
-                    "memory_add_embedding_type": "RETRIEVAL_DOCUMENT",
-                    "memory_update_embedding_type": "RETRIEVAL_DOCUMENT",
-                    "memory_search_embedding_type": "RETRIEVAL_QUERY"
-                }
-            },
-            "llm": {
         "provider": "gemini",
         "config": {
-            "model": "gemini-2.0-flash-001",
-            "temperature": 0.2,
-            "max_tokens": 2000,
-            "top_p": 1.0
+            "model": "models/text-embedding-004",
+            "api_key": os.getenv("GOOGLE_API_KEY"),
         }
+    },
+            "llm": {
+                "provider": "gemini",
+                "config": {
+                    "model": "gemini-2.0-flash-001",
+                    "api_key": os.getenv("GOOGLE_API_KEY"),
+                    "temperature": 0.2,
+                    "max_tokens": 2000,
+                    "top_p": 1.0
+                }
             }
         }
-        return config
     
     def _initialize_client(self):
         """Initialize the Mem0 client based on configuration."""
@@ -64,19 +73,37 @@ class MemoryManager:
                     raise ValueError("MEM0_API_KEY environment variable must be set for hosted mode")
                 logger.info("Initializing hosted Mem0 client")
                 return MemoryClient(api_key=api_key)
-            else:
-                logger.info("Initializing local Mem0 instance")
-                config = self._build_local_config()
-                return Memory.from_config(config)
+            
+            logger.info("Initializing local Mem0 instance with Qdrant")
+            
+            # Ensure Google Cloud credentials are set
+            google_creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+            if not google_creds_path or not os.path.exists(google_creds_path):
+                raise ValueError(
+                    "GOOGLE_APPLICATION_CREDENTIALS environment variable must point to a valid service account key file"
+                )
+            
+            # Set the project ID for Vertex AI
+            os.environ["GOOGLE_CLOUD_PROJECT"] = os.getenv("GOOGLE_CLOUD_PROJECT", "elite-thunder-461308")
+            
+            # Build and validate the configuration
+            config = self._build_local_config()
+            
+            # Initialize the client with the configuration
+            return Memory.from_config(config)
                 
         except Exception as e:
             logger.error(f"Failed to initialize Mem0: {str(e)}")
             raise
+
     def add_memory(
         self, 
         content: str, 
         metadata: Optional[Dict[str, Any]] = None,
-        document_id: Optional[str] = None
+        document_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        run_id: Optional[str] = None
     ) -> str:
         """Add a memory to the memory store.
         
@@ -84,18 +111,42 @@ class MemoryManager:
             content: The content to remember.
             metadata: Optional metadata associated with the memory.
             document_id: Optional ID of the document this memory is associated with.
+            user_id: Optional user ID for multi-tenant scenarios.
+            agent_id: Optional agent ID for multi-agent scenarios.
+            run_id: Optional run ID for tracking specific execution runs.
             
         Returns:
             The ID of the created memory.
+            
+        Raises:
+            ValueError: If required IDs are missing.
         """
         try:
             if not self.client:
                 raise RuntimeError("Memory client not initialized")
             
+            # Use instance user_id if not provided
+            user_id = user_id or self.user_id
+            
+            # Ensure at least one ID is provided
+            if not any([user_id, agent_id, run_id]):
+                raise ValueError(
+                    "At least one of 'user_id', 'agent_id', or 'run_id' must be provided. "
+                    f"Current values - user_id: {user_id}, agent_id: {agent_id}, run_id: {run_id}"
+                )
+            
             # Prepare metadata
             memory_metadata = metadata or {}
             if document_id:
                 memory_metadata['document_id'] = document_id
+            
+            # Add IDs to metadata if provided
+            if user_id:
+                memory_metadata['user_id'] = user_id
+            if agent_id:
+                memory_metadata['agent_id'] = agent_id
+            if run_id:
+                memory_metadata['run_id'] = run_id
             
             # Prepare the message according to Mem0 v1.0.0 API
             message = {
@@ -103,16 +154,21 @@ class MemoryManager:
                 'content': content
             }
             
-            # Prepare the add arguments
-            if not self.user_id:
-                raise ValueError("user_id must be set in MemoryManager configuration")
-                
+            # Prepare the add arguments with required IDs
             add_kwargs = {
-                'messages': [message],  # Must be a list of message objects
+                'messages': [message],
                 'metadata': memory_metadata,
-                'infer': True,  # Let Mem0 infer the facts
-                'user_id': self.user_id  # Required by Mem0 API
             }
+            
+            # Add required IDs to the request
+            if user_id:
+                add_kwargs['user_id'] = user_id
+            if agent_id:
+                add_kwargs['agent_id'] = agent_id
+            if run_id:
+                add_kwargs['run_id'] = run_id
+            
+            logger.debug(f"Adding memory with kwargs: {add_kwargs}")
             
             # Add the memory
             result = self.client.add(**add_kwargs)
@@ -124,16 +180,16 @@ class MemoryManager:
                     mem_id = res_list[0].get("id")
                     if mem_id is not None:
                         memory_id = str(mem_id)
-                        logger.debug(f"Added memory with ID: {memory_id}")
+                        logger.info(f"Successfully added memory with ID: {memory_id}")
                         return memory_id
             
-            logger.error("Failed to add memory: Invalid or empty response from Mem0")
+            logger.error(f"Failed to add memory. Response: {result}")
             return ""
             
         except Exception as e:
             logger.error(f"Error adding memory: {str(e)}")
             raise
-            
+
     def search_memories(
         self, 
         query: str = "",
@@ -156,87 +212,64 @@ class MemoryManager:
                 return []
             
             # Prepare search parameters
-            search_kwargs = {
+            search_params = {
                 'query': query,
                 'limit': top_k,
-                'metadata': filter_metadata or {}
+                'metadata': filter_metadata or {},
+                'user_id': self.user_id
             }
             
-            if self.user_id:
-                search_kwargs['user_id'] = self.user_id
-            
             # Execute search
-            results = self.client.search(**search_kwargs)
+            results = self.client.search(**search_params)
             
-            # Format results in a consistent way
+            # Format results
             memories = []
             for result in results:
-                memory_data = {
-                    'content': getattr(result, 'content', ''),
-                    'metadata': getattr(result, 'metadata', {}),
-                    'score': float(getattr(result, 'score', 0.0)),
-                    'id': str(getattr(result, 'id', ''))
-                }
-                memories.append(memory_data)
-            
-            # Sort by score in descending order
-            memories.sort(key=lambda x: x['score'], reverse=True)
+                if isinstance(result, dict):
+                    memories.append({
+                        'id': result.get('id'),
+                        'content': result.get('content', ''),
+                        'metadata': result.get('metadata', {}),
+                        'score': result.get('score', 0.0)
+                    })
             
             return memories
             
         except Exception as e:
             logger.error(f"Error searching memories: {str(e)}")
             return []
+
+def display_image(image_data: str, width: int = 400) -> None:
+    """Display an image from base64 data or file path in Streamlit.
     
-    def get_conversation_history(self, conversation_id: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get the conversation history for a specific conversation.
+    Args:
+        image_data: Base64 encoded image data or file path
+        width: Width to display the image (height will be scaled proportionally)
+    """
+    try:
+        # If it's a file path
+        if os.path.isfile(image_data):
+            image = Image.open(image_data)
+        # If it's base64 data
+        elif image_data.startswith('data:image'):
+            # Extract the base64 data
+            header, encoded = image_data.split(',', 1)
+            # Decode the base64 data
+            image = Image.open(BytesIO(base64.b64decode(encoded)))
+        else:
+            # Try to decode as base64 directly
+            try:
+                image = Image.open(BytesIO(base64.b64decode(image_data)))
+            except:
+                st.error("Invalid image data format")
+                return
         
-        Args:
-            conversation_id: The ID of the conversation.
-            limit: Maximum number of messages to return.
-            
-        Returns:
-            List of conversation messages with metadata.
-        """
-        try:
-            if not self.client:
-                logger.warning("Memory client not initialized. Returning empty history.")
-                return []
-            
-            # Prepare search parameters
-            search_kwargs = {
-                'metadata': {'conversation_id': conversation_id},
-                'limit': limit,
-                'sort': 'timestamp'  # Assuming timestamps are stored in metadata
-            }
-            
-            if self.user_id:
-                search_kwargs['user_id'] = self.user_id
-            
-            # Execute search
-            results = self.client.search(**search_kwargs)
-            
-            # Format results
-            messages = []
-            for result in results:
-                metadata = getattr(result, 'metadata', {})
-                messages.append({
-                    'content': getattr(result, 'content', ''),
-                    'metadata': metadata,
-                    'timestamp': metadata.get('timestamp'),
-                    'id': str(getattr(result, 'id', ''))
-                })
-            
-            # Sort by timestamp if available
-            if all(msg['timestamp'] is not None for msg in messages):
-                messages.sort(key=lambda x: x['timestamp'])
-            
-            return messages
-            
-        except Exception as e:
-            logger.error(f"Error getting conversation history: {str(e)}")
-            return []
-    
+        # Display the image
+        st.image(image, width=width, use_column_width=False)
+        
+    except Exception as e:
+        st.error(f"Error displaying image: {str(e)}")
+
     def clear_memories(self, filter_metadata: Optional[Dict[str, Any]] = None) -> bool:
         """Clear memories matching the filter criteria.
         

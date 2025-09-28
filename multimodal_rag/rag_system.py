@@ -1,19 +1,26 @@
 """Main RAG system implementation for multimodal retrieval and generation."""
+import asyncio
 import os
+import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
-
+from typing import Dict, List, Optional, Any, Union
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder, PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough
-from langchain_google_vertexai import ChatVertexAI
+from langchain_core.runnables import RunnablePassthrough, RunnableLambda
+from langchain_google_vertexai import ChatVertexAI, VertexAIEmbeddings
 
-from .config import MODEL_NAME, TOKEN_LIMIT, PROJECT_ID, LOCATION, USE_GCS
+from .config import (
+    PROJECT_ID,
+    LOCATION,
+    MODEL_NAME,
+    TOKEN_LIMIT,
+    USE_GCS,
+)
+
 from .document_processor import DocumentProcessor
-from .embeddings import EmbeddingManager
-from .utils import split_image_text_types, display_image
+from .vector_store import QdrantVectorStore
+from .memory_manager import MemoryManager, display_image
 
 
 class MultimodalRAG:
@@ -25,16 +32,16 @@ class MultimodalRAG:
         location: str = LOCATION,
         model_name: str = MODEL_NAME,
         token_limit: int = TOKEN_LIMIT,
-        use_gcs: bool = USE_GCS,
+        use_gcs: bool = False,  # Not used with Qdrant
     ):
         """Initialize the Multimodal RAG system.
         
         Args:
-            project_id: Google Cloud project ID (only used if use_gcs=True)
-            location: Google Cloud region (only used if use_gcs=True)
+            project_id: Google Cloud project ID (for LLM)
+            location: Google Cloud region (for LLM)
             model_name: Name of the model to use for generation
             token_limit: Maximum number of tokens for model responses
-            use_gcs: Whether to use Google Cloud Storage (False for local storage)
+            use_gcs: Kept for backward compatibility, not used with Qdrant
         """
         self.project_id = project_id
         self.location = location
@@ -44,9 +51,10 @@ class MultimodalRAG:
         
         # Initialize components
         self.document_processor = DocumentProcessor()
-        self.embedding_manager = None
         self.llm = None
         self.chain = None
+        self.embedding_model = None
+        self.vector_store = None
     
     def initialize(
         self,
@@ -54,342 +62,336 @@ class MultimodalRAG:
         endpoint_id: Optional[str] = None,
     ) -> None:
         """Initialize the RAG system components.
-        
         Args:
             index_id: Optional custom index ID (only used with GCS)
             endpoint_id: Optional custom endpoint ID (only used with GCS)
         """
-        print("Initializing embedding manager...")
-        # Initialize embedding manager with appropriate model
+        # Initialize the embedding model
+        print("Initializing embedding model...")
         try:
-            self.embedding_manager = EmbeddingManager(
-                api_key=os.getenv('GOOGLE_API_KEY'),
-                model_name="text-embedding-004",  # Use the correct embedding model
-                use_vision=False  # We'll handle vision separately
+            import os
+            from google.oauth2 import service_account
+            
+            # Path to your service account key file
+            credentials_path = os.path.join(os.path.dirname(__file__), "..", "elite-thunder-461308-f7-cc85c56bb209.json")
+            credentials = service_account.Credentials.from_service_account_file(
+                credentials_path,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
             )
             
-            # Initialize vector store based on storage type
-            if self.use_gcs:
-                print("Initializing GCS vector store...")
-                # Initialize vector store with existing index and endpoint for GCS
-                self.embedding_manager.initialize_vector_store(
-                    project_id=self.project_id,
-                    location=self.location,
-                    index_id=index_id,
-                    endpoint_id=endpoint_id
-                )
-            else:
-                print("Initializing local vector store...")
-                # Initialize local vector store
-                self.embedding_manager.initialize_vector_store(
-                    persist_directory=str(Path(__file__).parent.parent / "data" / "vector_store")
-                )
-                
+            # Initialize the embedding model with explicit credentials
+            self.embedding_model = VertexAIEmbeddings(
+                model_name="text-embedding-005",
+                project=self.project_id,
+                location=self.location,
+                credentials=credentials
+            )
+            print("Embedding model initialized successfully")
+            
+            # Initialize the vector store with the embedding model
+            self.vector_store = QdrantVectorStore(
+                collection_name="multimodal_rag",
+                embedding_model=self.embedding_model,
+                location=self.location
+            )
             print("Vector store initialized successfully")
             
         except Exception as e:
             print(f"Error initializing embedding manager: {e}")
+            print("Please ensure you have set up your Google Cloud credentials correctly.")
+            print("You can set the GOOGLE_APPLICATION_CREDENTIALS environment variable to point to your service account key file.")
             raise
         
         # Initialize the LLM
         try:
             print(f"Initializing LLM with model: {self.model_name}")
+            # Use the same credentials for the LLM
             self.llm = ChatVertexAI(
                 model_name=self.model_name,
                 project=self.project_id,
                 location=self.location,
                 max_output_tokens=self.token_limit,
                 temperature=0.0,
+                credentials=credentials  # Use the same credentials as above
             )
+            print("LLM initialized successfully")
         except Exception as e:
             print(f"Error initializing LLM: {e}")
             raise
-        
         # Create the RAG chain
         print("Creating RAG chain...")
         self._create_rag_chain()
         print("RAG system initialization complete")
     
-    def _create_rag_chain(self) -> None:
-        """Create the RAG chain with prompt template and model."""
-        # Define the prompt template
-        prompt_template = """You are a helpful assistant that answers questions based on the provided context.
-        Use the following pieces of context to answer the question at the end.
-        If you don't know the answer, just say that you don't know, don't try to make up an answer.
-        
-        Context:
-        {context}
-        
-        Question: {question}
-        
-        Answer:"""
-        
-        # Create the prompt
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful assistant that answers questions based on the provided context."),
-            MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{question}"),
-        ])
-        
-        # Define the RAG chain
-        self.chain = (
-            {
-                "context": self.retrieve_documents,
-                "question": RunnablePassthrough(),
-                "chat_history": lambda x: x.get("chat_history", []),
-            }
-            | RunnableLambda(self._format_prompt)
-            | self.llm
-            | StrOutputParser()
-        )
-    
-    def _format_prompt(self, data: Dict[str, Any]) -> List[Union[HumanMessage, str]]:
-        """Format the prompt with context and question."""
-        context = data["context"]
-        question = data["question"]
-        chat_history = data.get("chat_history", [])
-        
-        # Format context
-        formatted_context = []
-        if context["texts"]:
-            formatted_context.append("Text and tables:")
-            formatted_context.extend([f"- {text}" for text in context["texts"]])
-        
-        # Add image information if present
-        if context["images"]:
-            formatted_context.append("\nImages:")
-            for i, img in enumerate(context["images"], 1):
-                formatted_context.append(f"- Image {i} (see below)")
-        
-        # Combine all context
-        full_context = "\n".join(formatted_context) if formatted_context else "No relevant context found."
-        
-        # Create messages
-        messages = [
-            ("system", "You are a helpful assistant that answers questions based on the provided context."),
-            *chat_history,
-        ]
-        
-        # Create the human message with text content
-        human_message = [
-            ("human", f"Context:\n{full_context}\n\nQuestion: {question}")
-        ]
-        
-        # Add images if any
-        if context["images"]:
-            # Convert the human message to a list of message parts
-            message_parts = [{"type": "text", "text": f"Context:\n{full_context}\n\nQuestion: {question}"}]
-            
-            # Add image parts
-            for img_doc in context["images"]:
-                # Handle both Document objects and direct base64 strings
-                if hasattr(img_doc, 'metadata') and 'image_data' in img_doc.metadata:
-                    img_data = img_doc.metadata['image_data']
-                elif isinstance(img_doc, str):
-                    img_data = img_doc
-                else:
-                    print("Skipping invalid image format in context")
-                    continue
-                
-                # Clean up the image data if needed
-                if img_data.startswith('data:image/'):
-                    img_data = img_data.split(',', 1)[-1]
-                
-                # Add the image part
-                try:
-                    message_parts.append({
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{img_data}"}
-                    })
-                except Exception as e:
-                    print(f"Error adding image to message: {e}")
-            
-            # Only update the message if we have valid image parts
-            if len(message_parts) > 1:  # More than just the text part
-                human_message = [("human", message_parts)]
-            else:
-                # Fallback to text-only if no valid images were added
-                human_message = [("human", f"Context:\n{full_context}\n\nQuestion: {question}")]
-        
-        # Add the human message to the messages list
-        messages.extend(human_message)
-        
-        return messages
-    
-    def retrieve_documents(self, query: str) -> Dict[str, List]:
+    async def retrieve_documents(self, query: str, k: int = 5) -> List[Document]:
         """Retrieve relevant documents for a query.
         
         Args:
             query: The query string
+            k: Number of documents to retrieve
             
         Returns:
-            Dictionary with 'texts' and 'images' keys
+            List of relevant documents
         """
-        if self.embedding_manager is None:
-            raise ValueError("Embedding manager not initialized. Call initialize() first.")
-        
-        # Get relevant documents
-        docs = self.embedding_manager.get_relevant_documents(query, k=5)
-        
-        # Split into text and images
-        return split_image_text_types(docs)
-    
-    def query(
-        self,
-        question: str,
-        chat_history: Optional[List] = None,
-        return_context: bool = False,
-    ) -> Dict[str, Any]:
-        """Query the RAG system with a question.
-        
-        Args:
-            question: The question to ask
-            chat_history: Optional list of previous messages in the conversation
-            return_context: Whether to include the retrieved context in the response
+        if not self.vector_store:
+            raise ValueError("Vector store not initialized. Call initialize() first.")
             
-        Returns:
-            Dictionary with the answer and optionally the context
-        """
-        if self.chain is None:
-            self.initialize()
-        
-        # Prepare input
-        input_data = {
-            "question": question,
-            "chat_history": chat_history or [],
-        }
-        
-        # Get the answer and context
-        answer = self.chain.invoke(input_data)
-        
-        # Always retrieve context for citations, but only include in response if requested
-        context = self.retrieve_documents(question)
-        
-        # Prepare citations from context
-        citations = []
-        
-        # Process text documents
-        for doc in context.get('texts', []):
-            if hasattr(doc, 'metadata'):
-                source = doc.metadata.get('source', 'Unknown source')
-                page = doc.metadata.get('page', '')
-                citation_text = f"Source: {Path(source).name}"
-                if page:
-                    citation_text += f", Page: {page}"
-                
-                # Add a snippet of the content
-                content = doc.page_content[:200] + '...' if len(doc.page_content) > 200 else doc.page_content
-                
-                citations.append({
-                    'type': 'text',
-                    'source': source,
-                    'page': page,
-                    'content': content,
-                    'display_text': citation_text
-                })
-        
-        # Process images
-        for doc in context.get('images', []):
-            if hasattr(doc, 'metadata'):
-                source = doc.metadata.get('source', 'Unknown source')
-                citations.append({
-                    'type': 'image',
-                    'source': source,
-                    'image_path': doc.metadata.get('image_path', ''),
-                    'display_text': f"Image from: {Path(source).name}"
-                })
-        
-        # Prepare response
-        response = {
-            "answer": answer,
-            "citations": citations
-        }
-        
-        # Include full context if requested
-        if return_context:
-            response["context"] = context
-        
-        return response
+        try:
+            # Get relevant documents from the vector store
+            docs = await self.vector_store.similarity_search(query, k=k)
+            return docs
+        except Exception as e:
+            print(f"Error retrieving documents: {e}")
+            return []
     
-    def add_documents(
-        self,
-        file_path: str,
-        chunk_size: int = 4000,
-        chunk_overlap: int = 200,
-    ) -> Dict[str, List[str]]:
-        """Add documents to the RAG system.
+    async def _arun_retrieve_documents(self, inputs):
+        """Async wrapper for retrieve_documents to be used in the chain."""
+        question = inputs.get("question", "")
+        k = inputs.get("k", 4)
+        try:
+            # Directly await the async retrieve_documents method
+            return await self.retrieve_documents(question, k=k)
+        except Exception as e:
+            print(f"Error in _arun_retrieve_documents: {e}")
+            return []
+    
+    def _create_rag_chain(self) -> None:
+        """Create the RAG chain with prompt template and model."""
+        from langchain_core.runnables import RunnableLambda
+        from langchain_core.runnables.passthrough import RunnablePassthrough
+        
+        # Create a simple wrapper that will be used in the chain
+        async def retrieve_docs_wrapper(inputs):
+            try:
+                # Directly await the async retrieval
+                return await self._arun_retrieve_documents(inputs)
+            except Exception as e:
+                import traceback
+                print(f"Error in retrieve_docs_wrapper: {e}")
+                print(traceback.format_exc())
+                return []
+        
+        # Create a runnable that properly handles the async operation
+        retrieval_chain = RunnableLambda(
+            lambda x: asyncio.run(retrieve_docs_wrapper(x)),
+            name="retrieve_documents"
+        )
+        
+        # Define the prompt template
+        prompt_template = """You are a helpful assistant that answers questions based on the provided context.
+        
+Context:
+{context}
+        
+Chat History:
+{chat_history}
+        
+Question: {question}
+        
+Please provide a helpful response based on the context above."""
+        
+        # Create the prompt template
+        prompt = PromptTemplate(
+            template=prompt_template,
+            input_variables=["context", "question", "chat_history"]
+        )
+        
+        # Define the RAG chain with proper async handling
+        self.chain = (
+            {
+                "context": RunnablePassthrough() | retrieval_chain,
+                "question": lambda x: x["question"],
+                "chat_history": lambda x: x.get("chat_history", []),
+            }
+            | prompt
+            | self.llm
+            | StrOutputParser()
+        )
+    
+    async def _format_prompt(self, data: Dict[str, Any]) -> str:
+        """Format the prompt with context and question.
+        
+        Returns:
+            Formatted prompt string
+        """
+        try:
+            # Extract context and question from the input data
+            context = data.get("context", [])
+            
+            # If context is a list of documents, extract their content
+            if isinstance(context, list) and all(isinstance(doc, Document) for doc in context):
+                context = "\n\n".join([doc.page_content for doc in context if doc.page_content])
+            
+            question = data.get("question", "")
+            chat_history = data.get("chat_history", [])
+            
+            # Format the context for the prompt
+            context_str = ""
+            if context:
+                if isinstance(context, list):
+                    context_str = "\n\n".join([doc.page_content if hasattr(doc, 'page_content') else str(doc) for doc in context])
+                else:
+                    context_str = str(context)
+            
+            # Format chat history
+            chat_history_str = ""
+            for msg in chat_history:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "user":
+                    chat_history_str += f"\nUser: {content}"
+                elif role == "assistant":
+                    chat_history_str += f"\nAssistant: {content}"
+            
+            # Create the prompt with the context and chat history
+            prompt = f"""You are a helpful assistant that answers questions based on the provided context.
+            
+Context:
+{context_str}
+            
+{chat_history_str}
+            
+Question: {question}
+            
+Please provide a helpful response based on the context above."""
+            
+            return prompt.strip()
+            
+        except Exception as e:
+            print(f"Error in _format_prompt: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return a basic prompt if formatting fails
+            return f"You are a helpful assistant.\n\nQuestion: {question}"
+    
+    def add_documents(self, file_paths: Union[str, Path, List[Union[str, Path]]], **kwargs) -> Dict[str, int]:
+        """Add documents to the vector store.
         
         Args:
-            file_path: Path to the document file
-            chunk_size: Size of text chunks
-            chunk_overlap: Overlap between chunks
+{{ ... }}
+            file_paths: Single file path or list of file paths to process and add
+            **kwargs: Additional arguments for document processing
             
         Returns:
             Dictionary with counts of added documents by type
         """
-        if self.embedding_manager is None:
-            self.initialize()
+        import asyncio
         
-        # Process the document
-        elements = self.document_processor.process_file(file_path)
-        
+        async def _add_docs_async():
+            nonlocal file_paths
+            
+            # Convert single file path to list if needed
+            if isinstance(file_paths, (str, Path)):
+                file_paths = [file_paths]
+                
+            print(f"Starting to process {len(file_paths)} files...")
+            
+            # Process documents
+            all_elements = {
+                'texts': [],
+                'tables': [],
+                'images': []
+            }
+            
+            for file_path in file_paths:
+                elements = self.document_processor.process_file(file_path, **kwargs)
+                all_elements['texts'].extend(elements.get('texts', []))
+                all_elements['tables'].extend(elements.get('tables', []))
+                all_elements['images'].extend(elements.get('images', []))
+            
+            print(f"Processed elements - texts: {len(all_elements['texts'])}, "
+                  f"tables: {len(all_elements['tables'])}, "
+                  f"images: {len(all_elements['images'])}")
+            
+            elements = all_elements
+            
+            # Initialize counters
+            texts_added = 0
+            tables_added = 0
+            images_added = 0
+            
+            # Extract IDs from kwargs or use defaults
+            user_id = kwargs.get('user_id', 'default_user')
+            agent_id = kwargs.get('agent_id', 'default_agent')
+            run_id = kwargs.get('run_id', str(uuid.uuid4()))
+            
+            # Add required IDs to all documents
+            for doc_type in ["texts", "tables", "images"]:
+                if elements.get(doc_type):
+                    for doc in elements[doc_type]:
+                        if not hasattr(doc, 'metadata') or not doc.metadata:
+                            doc.metadata = {}
+                        doc.metadata.update({
+                            'user_id': user_id,
+                            'agent_id': agent_id,
+                            'run_id': run_id,
+                            'doc_type': doc_type.rstrip('s')  # 'texts' -> 'text', 'tables' -> 'table', etc.
+                        })
+            
+            # Add text documents
+            if elements.get("texts"):
+                print("Adding text documents to vector store...")
+                try:
+                    await self.vector_store.add_documents(elements["texts"])
+                    texts_added = len(elements["texts"])
+                    print(f"Successfully added {texts_added} text documents")
+                except Exception as e:
+                    print(f"Error adding text documents: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+            
+            # Add tables
+            if elements.get("tables"):
+                print("Adding tables to vector store...")
+                try:
+                    await self.vector_store.add_documents(elements["tables"])
+                    tables_added = len(elements["tables"])
+                    print(f"Successfully added {tables_added} tables")
+                except Exception as e:
+                    print(f"Error adding tables: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+            
+            # Add images (store as text with metadata)
+            if elements.get("images"):
+                print("Adding images to vector store...")
+                try:
+                    await self.vector_store.add_documents(elements["images"])
+                    images_added = len(elements["images"])
+                    print(f"Successfully added {images_added} images")
+                except Exception as e:
+                    print(f"Error adding images: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    raise
+                
+            result = {
+                "texts": texts_added,
+                "tables": tables_added,
+                "images": images_added,
+                "total": texts_added + tables_added + images_added
+            }
+            print(f"Document addition complete. Result: {result}")
+            return result
+            
         try:
-            # Generate summaries for text and tables
-            text_summaries = []
-            if elements["texts"]:
-                try:
-                    text_summaries = self._generate_summaries([doc.page_content for doc in elements["texts"]])
-                except Exception as e:
-                    print(f"Warning: Could not generate text summaries: {e}")
-                    # Use the first 200 characters as a fallback summary
-                    text_summaries = [doc.page_content[:200] + "..." for doc in elements["texts"]]
+            # Run the async function in the event loop
+            return asyncio.run(_add_docs_async())
             
-            table_summaries = []
-            if elements["tables"]:
-                try:
-                    table_summaries = self._generate_summaries([doc.page_content for doc in elements["tables"]])
-                except Exception as e:
-                    print(f"Warning: Could not generate table summaries: {e}")
-                    # Use the first 200 characters as a fallback summary
-                    table_summaries = [doc.page_content[:200] + "..." for doc in elements["tables"]]
-            
-            # Generate summaries for images
-            image_summaries = []
-            if elements["images"]:
-                try:
-                    # Pass the full document objects to access metadata
-                    image_summaries = self._generate_image_summaries(elements["images"])
-                except Exception as e:
-                    print(f"Warning: Could not generate image summaries: {e}")
-                    image_summaries = ["Image content"] * len(elements["images"])
-            
-            # Combine all documents and summaries
-            all_docs = elements["texts"] + elements["tables"] + elements["images"]
-            all_summaries = text_summaries + table_summaries + image_summaries
-            
-            # Add to vector store
-            doc_ids = self.embedding_manager.add_documents(
-                documents=all_docs,
-                summaries=all_summaries,
-            )
         except Exception as e:
-            print(f"Error during document processing: {e}")
-            raise
-        
-        # Return counts
-        return {
-            "texts": len(elements["texts"]),
-            "tables": len(elements["tables"]),
-            "images": len(elements["images"]),
-            "total": len(doc_ids),
-        }
+            print(f"Error in add_documents: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            # Return empty result with error
+            return {"texts": 0, "tables": 0, "images": 0, "total": 0, "error": str(e)}
     
-    def _generate_summaries(self, texts: List[str]) -> List[str]:
+    async def _generate_summaries(self, texts: List[str]) -> List[str]:
         """Generate summaries for a list of texts."""
         from .document_processor import generate_summaries
-        return generate_summaries(texts, model_name=self.model_name)
-    
-    def _generate_image_summaries(self, image_docs: List[Union[Document, str]]) -> List[str]:
+        return await generate_summaries(texts, model_name=self.model_name, use_qdrant=True)
+    async def _generate_image_summaries(self, image_docs: List[Union[Document, str]]) -> List[str]:
         """Generate summaries for a list of image documents.
         
         Args:
@@ -473,7 +475,64 @@ class MultimodalRAG:
             except Exception as e:
                 import traceback
                 print(f"Error generating summary for image: {str(e)}")
-                print(traceback.format_exc())
-                summaries.append("Image description not available")
+    async def query(
+        self,
+        question: str,
+        chat_history: Optional[List[dict[str, str]]] = None,
+        return_context: bool = False,
+        **kwargs
+    ) -> dict[str, Any]:
+        """Query the RAG system with a question.
+        
+        Args:
+            question: The user's question
+            chat_history: List of previous chat messages in the format [{"role": "user"|"assistant", "content": "message"}]
+            return_context: Whether to include the retrieved context in the response
+            **kwargs: Additional arguments for the query
+            
+        Returns:
+            Dictionary containing the answer and optionally the context
+        """
+        if not self.chain:
+            raise ValueError("RAG system not initialized. Call initialize() first.")
+            
+        # Prepare the input data
+        input_data = {"question": question}
+        if chat_history:
+            input_data["chat_history"] = chat_history
+        
+        try:
+            # Get the answer from the chain using the async method
+            answer = await self.chain.ainvoke(input_data)
+            
+            # If requested, get the context as well
+            context = []
+            if return_context:
+                docs = await self.retrieve_documents(question)
+                context = [
+                    {
+                        "content": doc.page_content,
+                        "metadata": doc.metadata
+                    }
+                    for doc in docs
+                ]
+            
+            # Format the response
+            response = {
+                "answer": answer if isinstance(answer, str) else str(answer),
+                "sources": []
+            }
+            
+            if return_context:
+                response["context"] = context
                 
-        return summaries
+            return response
+            
+        except Exception as e:
+            import traceback
+            print(f"Error in query: {e}")
+            print(traceback.format_exc())
+            return {
+                "answer": "Sorry, I encountered an error while processing your request.",
+                "sources": []
+            }

@@ -78,36 +78,68 @@ def main():
                 print(f"Error processing {file_path}: {e}", file=sys.stderr)
     
     elif args.command == "query":
-        if args.interactive:
-            print("Interactive mode. Type 'exit' to quit.")
-            while True:
-                try:
-                    query = input("\nEnter your query: ")
-                    if query.lower() in ("exit", "quit"):
-                        break
-                    
-                    response = rag.query(query, return_context=True)
-                    print(f"\nAnswer: {response['answer']}")
-                    
-                    if 'context' in response:
-                        context = response['context']
-                        if context['texts']:
-                            print("\nRelevant text snippets:")
-                            for i, text in enumerate(context['texts'][:3]):
-                                print(f"{i+1}. {text[:200]}...")
+        import asyncio
+        import nest_asyncio
+        
+        # Apply nest_asyncio to allow nested event loops (useful in Jupyter/notebooks)
+        nest_asyncio.apply()
+        
+        async def run_query():
+            try:
+                # Initialize the RAG system
+                rag = MultimodalRAG()
+                await rag.initialize()
                 
-                except KeyboardInterrupt:
-                    print("\nExiting...")
-                    break
-                except Exception as e:
-                    print(f"Error: {e}", file=sys.stderr)
-        else:
-            if not args.query:
-                print("Error: Query string is required in non-interactive mode", file=sys.stderr)
+                if args.interactive:
+                    print("Interactive mode. Type 'exit' to quit.")
+                    while True:
+                        try:
+                            query = input("\nEnter your query: ")
+                            if query.lower() in ("exit", "quit"):
+                                break
+                            
+                            response = await rag.query(query, return_context=True)
+                            print(f"\nAnswer: {response['answer']}")
+                            
+                            if 'context' in response and isinstance(response['context'], list):
+                                print("\nRelevant text snippets:")
+                                for i, doc in enumerate(response['context'][:3]):
+                                    content = doc.get('content', str(doc))
+                                    print(f"{i+1}. {content[:200]}...")
+                        
+                        except KeyboardInterrupt:
+                            print("\nExiting...")
+                            break
+                        except Exception as e:
+                            print(f"Error: {e}", file=sys.stderr)
+                            import traceback
+                            traceback.print_exc()
+                else:
+                    if not args.query:
+                        print("Error: Query string is required in non-interactive mode", file=sys.stderr)
+                        return 1
+                        
+                    response = await rag.query(args.query, return_context=True)
+                    print(response['answer'])
+                    
+            except Exception as e:
+                print(f"Error initializing RAG system: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc()
                 return 1
-                
-            response = rag.query(args.query, return_context=True)
-            print(response['answer'])
+        
+        # Create a new event loop for the async function
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # Run the async function
+            loop.run_until_complete(run_query())
+        except KeyboardInterrupt:
+            print("\nExiting...")
+        finally:
+            # Clean up the event loop
+            loop.close()
     
     elif args.command == "list":
         print("List documents functionality not yet implemented.")

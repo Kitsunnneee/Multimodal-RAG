@@ -1,15 +1,21 @@
 """Document loader using LlamaParse for advanced document parsing."""
+import asyncio
+import logging
+import nest_asyncio
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+
+# Apply nest_asyncio to allow nested event loops
+nest_asyncio.apply()
 
 from langchain_core.documents import Document
 from llama_cloud_services import LlamaParse
 from unstructured.partition.pdf import partition_pdf
 
 from .config import DATA_DIR
-from .utils import is_image_data, split_image_text_types
 
+logger = logging.getLogger(__name__)
 
 class LlamaParseLoader:
     """Document loader that uses LlamaParse for advanced document parsing."""
@@ -51,195 +57,183 @@ class LlamaParseLoader:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.timeout = timeout
     
+    async def _aload_file(self, file_path: Path, file_type: str, metadata: Dict[str, Any]) -> List[Document]:
+        """Async implementation of file loading with LlamaParse."""
+        try:
+            # Ensure file exists and is accessible
+            if not file_path.exists():
+                raise FileNotFoundError(f"File not found: {file_path}")
+            if not os.access(file_path, os.R_OK):
+                raise PermissionError(f"No read permissions for file: {file_path}")
+                
+            # Read file content first to ensure it's accessible
+            try:
+                with open(file_path, 'rb') as f:
+                    # Just check if we can read the first few bytes
+                    f.read(1024)
+            except Exception as e:
+                raise IOError(f"Error reading file {file_path}: {str(e)}")
+            
+            # Use aparser for async parsing
+            logger.info(f"Processing file: {file_path}")
+            try:
+                parsed_result = await self.parser.aparse(str(file_path), extra_info=metadata)
+                return self._handle_parsed_result(parsed_result, metadata)
+            except Exception as e:
+                logger.error(f"Error in LlamaParse for {file_path}: {str(e)}", exc_info=True)
+                return [
+                    Document(
+                        page_content=f"Error processing file with LlamaParse: {str(e)}",
+                        metadata={"error": str(e), **metadata}
+                    )
+                ]
+            
+        except Exception as e:
+            logger.error(f"Error loading file {file_path}: {str(e)}", exc_info=True)
+            return [
+                Document(
+                    page_content=f"Error loading file: {str(e)}",
+                    metadata={"error": str(e), "file_path": str(file_path), **metadata}
+                )
+            ]
+    
+    def _handle_parsed_result(self, parsed_result: Any, metadata: Dict[str, Any]) -> List[Document]:
+        """Handle different types of parsed results from LlamaParse."""
+        documents = []
+        
+        # Handle JobResult object
+        if hasattr(parsed_result, 'parsed'):
+            content = parsed_result.parsed
+            if hasattr(content, 'text'):
+                documents.append(Document(
+                    page_content=content.text,
+                    metadata=metadata
+                ))
+        
+        # Handle direct text attribute
+        elif hasattr(parsed_result, 'text'):
+            documents.append(Document(
+                page_content=parsed_result.text,
+                metadata=metadata
+            ))
+        
+        # Handle batch results
+        elif hasattr(parsed_result, 'results') and isinstance(parsed_result.results, list):
+            for i, result in enumerate(parsed_result.results):
+                content = getattr(result, 'parsed', result)
+                if hasattr(content, 'text'):
+                    doc_meta = {**metadata, "chunk": i}
+                    documents.append(Document(
+                        page_content=content.text,
+                        metadata=doc_meta
+                    ))
+        
+        # Handle list of results
+        elif isinstance(parsed_result, list):
+            for i, result in enumerate(parsed_result):
+                content = getattr(result, 'parsed', result)
+                if hasattr(content, 'text'):
+                    doc_meta = {**metadata, "chunk": i}
+                    documents.append(Document(
+                        page_content=content.text,
+                        metadata=doc_meta
+                    ))
+        
+        # Handle dictionary response
+        elif isinstance(parsed_result, dict):
+            if 'text' in parsed_result:
+                documents.append(Document(
+                    page_content=parsed_result['text'],
+                    metadata=metadata
+                ))
+            elif 'parsed' in parsed_result and hasattr(parsed_result['parsed'], 'text'):
+                documents.append(Document(
+                    page_content=parsed_result['parsed'].text,
+                    metadata=metadata
+                ))
+        
+        # If we still don't have documents, try to convert the entire result to string
+        if not documents and parsed_result is not None:
+            try:
+                documents.append(Document(
+                    page_content=str(parsed_result),
+                    metadata={**metadata, "fallback_conversion": True}
+                ))
+            except Exception as e:
+                logger.warning(f"Could not convert parsed result to string: {str(e)}")
+                documents.append(Document(
+                    page_content=f"Error processing document: {str(e)}\n\nRaw result: {str(parsed_result)[:1000]}",
+                    metadata={**metadata, "error": str(e)}
+                ))
+        
+        return documents
+        
     def load_file(
         self,
         file_path: Union[str, Path],
         file_type: Optional[str] = None,
         extra_info: Optional[Dict[str, Any]] = None,
     ) -> List[Document]:
-        """Load and parse a document using LlamaParse.
+        """Load and parse a single file.
         
         Args:
             file_path: Path to the file to load
-            file_type: File type (e.g., 'pdf', 'docx'). If None, inferred from file extension.
-            extra_info: Additional metadata to include in the documents
+            file_type: Optional file type/extension
+            extra_info: Additional metadata to include in the document
             
         Returns:
-            List of Document objects with parsed content and metadata
+            List of Document objects from the file
         """
-        file_path = Path(file_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-        
-        # Set default file type if not provided
-        if file_type is None:
-            file_type = file_path.suffix.lower().lstrip('.')
-        
-        # Prepare metadata
-        metadata = {
-            "source": str(file_path),
-            "file_name": file_path.name,
-            "file_type": file_type,
-            **(extra_info or {})
-        }
-        
         try:
-            # Parse the document using LlamaParse
-            parsed_result = self.parser.parse(file_path, extra_info=metadata)
+            file_path = Path(file_path)
+            if not file_path.exists() or not file_path.is_file():
+                raise FileNotFoundError(f"File not found or is not a file: {file_path}")
+                
+            # Use provided file_type or extract from path
+            file_ext = file_type or file_path.suffix.lower().lstrip('.')
+            if not file_ext:
+                raise ValueError(f"Could not determine file type for {file_path}")
+                
+            metadata = extra_info or {}
+            metadata.update({
+                "source": str(file_path),
+                "file_name": file_path.name,
+                "file_type": file_ext
+            })
             
-            # Convert to LangChain documents
-            documents = []
+            # Ensure the file is readable
+            if not os.access(file_path, os.R_OK):
+                raise PermissionError(f"No read permissions for file: {file_path}")
             
-            # Debug: Print the type and available attributes of parsed_result
-            print(f"Parsed result type: {type(parsed_result)}")
-            if hasattr(parsed_result, '__dict__'):
-                print(f"Available attributes: {vars(parsed_result).keys()}")
-            
-            # Handle different response formats from LlamaParse
-            try:
-                # Try to access as a JobResult object first
-                if hasattr(parsed_result, 'parsed'):
-                    # Handle JobResult.parsed which might contain the actual content
-                    content = parsed_result.parsed
-                    if hasattr(content, 'text'):
-                        documents.append(Document(
-                            page_content=content.text,
-                            metadata=metadata
-                        ))
-                
-                # Handle direct text attribute
-                elif hasattr(parsed_result, 'text'):
-                    documents.append(Document(
-                        page_content=parsed_result.text,
-                        metadata=metadata
-                    ))
-                
-                # Handle batch results
-                elif hasattr(parsed_result, 'results') and isinstance(parsed_result.results, list):
-                    for i, result in enumerate(parsed_result.results):
-                        content = getattr(result, 'parsed', result)  # Try to get parsed content or use result
-                        if hasattr(content, 'text'):
-                            doc_meta = {**metadata, "chunk": i}
-                            documents.append(Document(
-                                page_content=content.text,
-                                metadata=doc_meta
-                            ))
-                
-                # Handle list of results
-                elif isinstance(parsed_result, list):
-                    for i, result in enumerate(parsed_result):
-                        content = getattr(result, 'parsed', result)  # Try to get parsed content or use result
-                        if hasattr(content, 'text'):
-                            doc_meta = {**metadata, "chunk": i}
-                            documents.append(Document(
-                                page_content=content.text,
-                                metadata=doc_meta
-                            ))
-                
-                # Handle dictionary response
-                elif isinstance(parsed_result, dict):
-                    if 'text' in parsed_result:
-                        documents.append(Document(
-                            page_content=parsed_result['text'],
-                            metadata=metadata
-                        ))
-                    elif 'parsed' in parsed_result and hasattr(parsed_result['parsed'], 'text'):
-                        documents.append(Document(
-                            page_content=parsed_result['parsed'].text,
-                            metadata=metadata
-                        ))
-                
-                # If we still don't have documents, try to convert the entire result to string
-                if not documents and parsed_result is not None:
-                    documents.append(Document(
-                        page_content=str(parsed_result),
-                        metadata={**metadata, "fallback_conversion": True}
-                    ))
-                    
-            except Exception as parse_error:
-                print(f"Error processing LlamaParse result: {parse_error}")
-                # If we can't process the result, include it as a string for debugging
-                documents.append(Document(
-                    page_content=f"Error processing document: {str(parse_error)}\n\nRaw result: {str(parsed_result)[:1000]}",
-                    metadata={**metadata, "error": str(parse_error)}
-                ))
+            # Run the async load operation in an event loop
+            loop = asyncio.get_event_loop()
+            documents = loop.run_until_complete(
+                self._aload_file(file_path, file_ext, metadata)
+            )
             
             if not documents:
-                raise ValueError("No valid document content found in LlamaParse response")
+                logger.warning(f"No documents were extracted from {file_path}")
+                return [
+                    Document(
+                        page_content="No content extracted from file",
+                        metadata=metadata
+                    )
+                ]
                 
             return documents
+            
+        except asyncio.CancelledError:
+            logger.error(f"File processing was cancelled: {file_path}")
+            raise
             
         except Exception as e:
-            print(f"LlamaParse failed: {e}")
-            print(f"Error type: {type(e).__name__}")
-            import traceback
-            print(f"Traceback: {traceback.format_exc()}")
-            
-            if not str(file_path).lower().endswith('.pdf'):
-                # For non-PDF files, re-raise the exception to try other loaders
-                print(f"Non-PDF file, re-raising error to try other loaders")
-                raise
-                
-            print("Falling back to unstructured for PDF...")
-            try:
-                # Try with standard PDF parsing first
-                elements = partition_pdf(
-                    filename=str(file_path),
-                    extract_images_in_pdf=False,
-                    infer_table_structure=True,
-                    chunking_strategy="by_title",
-                    max_characters=1000,
-                    new_after_n_chars=900,
-                    combine_text_under_n_chars=500,
+            logger.error(f"Error loading file {file_path}: {str(e)}", exc_info=True)
+            return [
+                Document(
+                    page_content=f"Error loading file: {str(e)}",
+                    metadata={"error": str(e), **metadata} if 'metadata' in locals() else {"error": str(e), "file_path": str(file_path)}
                 )
-                
-                # If we got elements, use them
-                if elements:
-                    documents = [
-                        Document(
-                            page_content=str(element),
-                            metadata={
-                                **metadata,
-                                "element_type": str(type(element).__name__),
-                                "chunk": i,
-                            }
-                        )
-                        for i, element in enumerate(elements)
-                    ]
-                    return documents
-                
-            except Exception as e:
-                print(f"Standard PDF parsing failed: {e}")
-                
-            # Fallback to simpler parsing if standard parsing fails
-            try:
-                print("Trying fallback PDF parsing...")
-                elements = partition_pdf(
-                    filename=str(file_path),
-                    extract_images_in_pdf=False,
-                    infer_table_structure=False,
-                    chunking_strategy="basic",
-                )
-                
-                documents = [
-                    Document(
-                        page_content=str(element),
-                        metadata={
-                            **metadata,
-                            "element_type": str(type(element).__name__),
-                            "chunk": i,
-                            "fallback_parser": True
-                        }
-                    )
-                    for i, element in enumerate(elements)
-                ]
-                return documents
-                
-            except Exception as e:
-                print(f"Fallback PDF parsing failed: {e}")
-                raise ValueError(f"Failed to parse PDF with any available method: {e}")
-            
-            return documents
+            ]
     
     def load_directory(
         self,

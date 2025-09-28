@@ -3,6 +3,7 @@ Streamlit UI for Multimodal RAG System with Mem0 Memory
 """
 import os
 import tempfile
+import asyncio
 import streamlit as st
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -55,11 +56,16 @@ with st.sidebar:
     # Initialize/Reset button
     if st.button("Initialize/Reset System"):
         with st.spinner("Initializing RAG system..."):
+            # Create and initialize the RAG system
             st.session_state.rag_system = MultimodalRAG(
                 model_name=model_name,
                 token_limit=TOKEN_LIMIT
             )
             
+            # Initialize the RAG system
+            st.session_state.rag_system.initialize()
+            
+            # Initialize memory if enabled
             if use_memory:
                 st.session_state.memory_manager = MemoryManager(
                     collection_name=memory_collection,
@@ -191,10 +197,12 @@ if prompt := st.chat_input("Ask a question about your documents..."):
             with st.spinner("Thinking..."):
                 try:
                     # Get response from RAG system
-                    response = st.session_state.rag_system.query(
-                        question=prompt,
-                        chat_history=st.session_state.chat_history,
-                        return_context=True
+                    response = asyncio.run(
+                        st.session_state.rag_system.query(
+                            question=prompt,
+                            chat_history=st.session_state.chat_history,
+                            return_context=True
+                        )
                     )
                     
                     # Display response

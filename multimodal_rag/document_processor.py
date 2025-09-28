@@ -99,8 +99,20 @@ class DocumentProcessor:
         use_llama = use_llama_parse if use_llama_parse is not None else self.use_llama_parse
         if use_llama and self.llama_loader and file_type in ['.pdf', '.docx', '.pptx', '.xlsx']:
             try:
+                # Filter out parameters that LlamaParse doesn't accept
+                llama_kwargs = {k: v for k, v in kwargs.items() 
+                              if k not in ['chunk_size', 'chunk_overlap', 'extract_images', 'infer_table_structure']}
+                
+                # Remove any remaining parameters that might cause issues
+                llama_kwargs = {k: v for k, v in llama_kwargs.items() 
+                              if not k.startswith('chunk_') and k != 'overlap'}
+                
                 # Remove the dot for the file_type parameter since LlamaParse expects it without dot
-                documents = self.llama_loader.load_file(file_path, file_type=file_type.lstrip('.'), **kwargs)
+                documents = self.llama_loader.load_file(
+                    file_path, 
+                    file_type=file_type.lstrip('.'), 
+                    **llama_kwargs
+                )
                 result["texts"] = documents
                 return result
             except Exception as e:
