@@ -3,33 +3,72 @@
 This script demonstrates how to use Mem0 for memory management in a RAG system.
 """
 import os
+import sys
 import datetime
 from dotenv import load_dotenv
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
-# Set a dummy OpenAI API key to bypass the requirement
-os.environ["OPENAI_API_KEY"] = "dummy-key"
-
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
-# Now import Mem0 after setting environment variables
+# Import Mem0 after setting environment variables
 from mem0 import Memory
 
-# Initialize Vertex AI if Google Cloud project is set
-if os.getenv("GOOGLE_CLOUD_PROJECT"):
+# Check for required environment variables
+GEMINI_AVAILABLE = False
+
+# Check if we can use Google's Gemini
+if os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or os.getenv("GOOGLE_API_KEY"):
+    try:
+        # For direct Gemini API access
+        import google.generativeai as genai
+        
+        # Configure with application default credentials
+        if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+            import google.auth
+            credentials, project = google.auth.default()
+            genai.configure(credentials=credentials)
+            print("Using Google Application Default Credentials")
+        else:
+            # Fallback to API key (may not work for all features)
+            genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+            print("Using Google API Key (some features may be limited)")
+        
+        # Verify the API works by listing available models
+        try:
+            models = genai.list_models()
+            if any('gemini' in model.name for model in models):
+                GEMINI_AVAILABLE = True
+                print("Google Gemini API is available and working")
+            else:
+                print("Google Gemini API is available but no Gemini models found")
+        except Exception as e:
+            print(f"Warning: Could not verify Google Gemini API: {str(e)}")
+            
+    except ImportError:
+        print("google-generativeai package not installed. Please install it with: pip install google-generativeai")
+    except Exception as e:
+        print(f"Warning: Could not initialize Google Gemini: {str(e)}")
+else:
+    print("Google Gemini not configured - set GOOGLE_APPLICATION_CREDENTIALS or GOOGLE_API_KEY environment variable")
+
+# Check for Vertex AI (alternative approach)
+if os.getenv("GOOGLE_CLOUD_PROJECT") and not GEMINI_AVAILABLE:
     try:
         vertexai.init(
             project=os.getenv("GOOGLE_CLOUD_PROJECT"),
             location=os.getenv("VERTEX_AI_LOCATION", "us-central1")
         )
         GEMINI_AVAILABLE = True
+        print("Google Vertex AI is available")
     except Exception as e:
         print(f"Warning: Could not initialize Vertex AI: {str(e)}")
-        GEMINI_AVAILABLE = False
-else:
-    GEMINI_AVAILABLE = False
+
+# Set a dummy OpenAI API key if not set
+if not os.getenv("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = "dummy-key"
+    print("Using dummy OpenAI API key for embedding model")
 
 class Mem0Integration:
     """Class to demonstrate Mem0 integration with Gemini."""
@@ -38,44 +77,90 @@ class Mem0Integration:
         """Initialize the Mem0 integration with Gemini."""
         # Initialize Gemini model if available
         self.gemini_model = None
-        if GEMINI_AVAILABLE:
-            try:
-                self.gemini_model = GenerativeModel("gemini-1.5-pro")
-                print("Successfully initialized Gemini model")
-            except Exception as e:
-                print(f"Warning: Could not initialize Gemini model: {str(e)}")
-                print("Some features may be limited")
-        else:
-            print("Gemini model not available. Using in-memory storage only.")
-
-        # Initialize Mem0 with minimal configuration
+        
+        # Configure Mem0 with Google's Gemini
         try:
-            # Configure Mem0 with minimal settings
-            config = {
-                "llm": {
-                    "provider": "openai",  # Required but won't be used
-                    "config": {
-                        "api_key": "dummy-key"  # Dummy key to bypass validation
-                    }
-                },
-                "embedder": {
-                    "provider": "openai",  # Required but won't be used
-                    "config": {
-                        "api_key": "dummy-key"  # Dummy key to bypass validation
-                    }
-                },
-                "vector_store": {
-                    "provider": "in-memory"  # Use in-memory storage
-                }
-            }
+            # Check if we have the required API key
+            google_api_key = os.getenv("GOOGLE_API_KEY")
+            openai_api_key = os.getenv("OPENAI_API_KEY", "dummy-key")  # For embedding model
             
-            self.memory = Memory(config=config)
-            print("Initialized Mem0 with in-memory storage")
-            self._memories = []  # Initialize in-memory storage as fallback
-            
+            if os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or google_api_key:
+                # Configure Mem0 with the correct structure
+                # Create a configuration class instance instead of a dictionary
+                from mem0.configs import MemoryConfig
+                
+                config = MemoryConfig(
+                    version="v1.1",
+                    llm={
+                        "provider": "google",
+                        "config": {
+                            "model": "gemini-1.5-pro",
+                            "project_id": os.getenv("GOOGLE_CLOUD_PROJECT"),
+                            "location": os.getenv("VERTEX_AI_LOCATION", "us-central1"),
+                            "temperature": 0.2,
+                            "max_tokens": 2000,
+                            "top_p": 1.0
+                        }
+                    },
+                    embedder={
+                        "provider": "google",
+                        "config": {
+                            "project_id": os.getenv("GOOGLE_CLOUD_PROJECT"),
+                            "location": os.getenv("VERTEX_AI_LOCATION", "us-central1"),
+                            "model": "text-embedding-004"
+                        }
+                    },
+                    vector_store={
+                        "provider": "in-memory"
+                    }
+                )
+                
+                # Set the custom fact extraction prompt as an attribute
+                config.custom_fact_extraction_prompt = """
+                Analyze the input and extract key facts. Focus on entities, actions, and relationships.
+                Return a JSON object with a 'facts' array containing the extracted facts.
+                Example: {"facts": ["User mentioned they like Python", "User is learning about AI"]}
+                """
+                
+                # If using API key (not recommended for production)
+                if google_api_key and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+                    config["llm"]["config"]["api_key"] = google_api_key
+                    config["embedder"]["config"]["api_key"] = google_api_key
+                
+                # Initialize Gemini model if available
+                self.gemini_model = None
+                if GEMINI_AVAILABLE:
+                    try:
+                        import google.generativeai as genai
+                        
+                        # Configure with the appropriate authentication method
+                        if os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+                            # Using application default credentials
+                            import google.auth
+                            credentials, _ = google.auth.default()
+                            genai.configure(credentials=credentials)
+                        elif google_api_key:
+                            # Fallback to API key if available
+                            genai.configure(api_key=google_api_key)
+                        
+                        # Initialize the model
+                        self.gemini_model = genai.GenerativeModel('gemini-pro')
+                        print("Successfully initialized Gemini model")
+                    except Exception as e:
+                        print(f"Warning: Could not initialize Gemini model: {str(e)}")
+                        self.gemini_model = None
+                        
+                # Initialize Mem0 with Gemini configuration
+                self.memory = Memory(config=config)
+                print("Initialized Mem0 with Gemini")
+                
+            else:
+                print("GOOGLE_API_KEY not found. Using in-memory storage only.")
+                self._memories = []
+                
         except Exception as e:
-            print(f"Warning: Could not initialize Mem0: {str(e)}")
-            print("Falling back to in-memory storage only...")
+            print(f"Warning: Could not initialize Mem0 with Gemini: {str(e)}")
+            print("Falling back to in-memory storage...")
             self._memories = []  # Fallback to in-memory storage only
         
     def add_memory(self, content, user_id="default_user"):
@@ -88,29 +173,49 @@ class Mem0Integration:
         # Check if we're using the in-memory fallback
         if hasattr(self, '_memories'):
             # Using in-memory fallback
-            self._memories.append({
+            memory_item = {
                 'content': content,
                 'user_id': user_id,
                 'timestamp': datetime.datetime.now().isoformat()
-            })
+            }
+            self._memories.append(memory_item)
             print(f"[In-memory] Added memory: {content[:100]}...")
-        else:
-            # Try to use Mem0 if available
-            try:
-                # Add a simple memory
-                self.memory.add(
-                    messages=[{"role": "user", "content": content}],
-                    user_id=user_id
-                )
-                print(f"[Mem0] Added memory: {content[:100]}...")
-            except Exception as e:
-                print(f"Warning: Could not add memory to Mem0: {str(e)}")
-                print("Falling back to in-memory storage...")
-                self._memories = [{
-                    'content': content,
-                    'user_id': user_id,
-                    'timestamp': datetime.datetime.now().isoformat()
-                }]
+            return memory_item
+            
+        # Try to use Mem0 if available
+        try:
+            # Format the message according to Mem0's expected format
+            message = {
+                "role": "user",
+                "content": content
+            }
+            
+            # Add the memory
+            result = self.memory.add(
+                messages=[message],
+                user_id=user_id,
+                infer=True  # Let Mem0 infer the facts
+            )
+            
+            print(f"[Mem0] Added memory: {content[:100]}...")
+            return result
+            
+        except Exception as e:
+            print(f"Warning: Could not add memory to Mem0: {str(e)}")
+            print("Falling back to in-memory storage...")
+            
+            # Initialize in-memory storage if it doesn't exist
+            if not hasattr(self, '_memories'):
+                self._memories = []
+                
+            # Add to in-memory storage
+            memory_item = {
+                'content': content,
+                'user_id': user_id,
+                'timestamp': datetime.datetime.now().isoformat()
+            }
+            self._memories.append(memory_item)
+            return memory_item
     
     def search_memories(self, query, limit=3, user_id="default_user"):
         """Search for relevant memories using a simple keyword search.
@@ -186,49 +291,55 @@ class Mem0Integration:
                 print("Falling back to simple memory search")
                 return []
     
-    def chat_with_memory(self, user_input, user_id="default_user"):
-        """Simulate a chat interaction with memory using Gemini or fallback.
-        
-        Args:
-            user_input: The user's input message.
-            user_id: User ID for the conversation
-            
-        Returns:
-            The assistant's response.
-        """
+    def chat_with_memory(self, user_input: str, user_id: str = "default_user") -> str:
+        """Chat with the user using memory and Gemini if available."""
         try:
             # First, search for relevant memories
-            relevant_memories = self.search_memories(user_input, limit=2, user_id=user_id)
+            search_results = self.memory.search(
+                query=user_input,
+                user_id=user_id,
+                limit=3
+            )
             
-            # Create context from memories
-            if hasattr(self, '_memories'):
-                # Using in-memory fallback
-                memories_context = "\n".join(
-                    f"- {mem.get('content', '')}" 
-                    for mem in relevant_memories
-                )
-            else:
-                # Using Mem0's format
-                memories_context = "\n".join(
-                    f"- {mem.get('content', str(mem))}" 
-                    for mem in relevant_memories
-                )
+            # Extract relevant memories
+            relevant_memories = search_results.get("results", [])
+            
+            # Format memories as context
+            memories_context = "\n".join(
+                f"- {mem.get('memory', mem.get('content', ''))}" for mem in relevant_memories
+            )
+            
+            # If we have memories, use them as context
+            if memories_context:
+                print(f"\nSearch results for '{user_input}':")
+                for i, mem in enumerate(relevant_memories[:3], 1):
+                    mem_content = str(mem.get('memory', mem.get('content', '')))
+                    print(f"{i}. {mem_content[:100]}{'...' if len(mem_content) > 100 else ''}")
+                print()
             
             # If Gemini is available, use it for generating responses
             if self.gemini_model:
                 try:
+                    # Prepare the prompt with context
+                    prompt = f"""Use the following context to answer the user's question.
+                    
+                    Context:
+                    {memories_context if memories_context else 'No relevant context found.'}
+                    
+                    Question: {user_input}
+                    
+                    Answer in a helpful and concise way:"""
+                    
                     # Generate response using Gemini
-                    prompt = f"""You are a helpful AI assistant. Use the following context to answer the user's question.
-                    
-                    Previous context:
-                    {memories_context}
-                    
-                    Current conversation:
-                    User: {user_input}
-                    Assistant:"""
-                    
                     response = self.gemini_model.generate_content(prompt)
-                    assistant_response = response.text
+                    
+                    # Extract the response text
+                    if hasattr(response, 'text'):
+                        assistant_response = response.text
+                    elif hasattr(response, 'candidates') and response.candidates:
+                        assistant_response = response.candidates[0].content.parts[0].text
+                    else:
+                        raise ValueError("Unexpected response format from Gemini")
                     
                     # Add the interaction to memory
                     self.add_memory(
@@ -247,7 +358,10 @@ class Mem0Integration:
                 return "I don't have enough information to respond to that. Could you provide more details?"
                 
             # Simple fallback response based on memories
-            memory_text = " ".join(str(mem.get('content', '')) for mem in relevant_memories)
+            memory_text = " ".join(
+                str(mem.get('memory', mem.get('content', ''))) 
+                for mem in relevant_memories
+            )
             
             # Add a simple response based on the memory content
             response = f"Based on what you've told me: {memory_text[:200]}..."
