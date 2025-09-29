@@ -91,7 +91,7 @@ class MultimodalRAG:
             print(f"Error initializing embedding manager: {e}")
             raise
         
-        # Initialize the LLM
+        # Initialize the LLM with fallback handling
         try:
             print(f"Initializing LLM with model: {self.model_name}")
             self.llm = ChatVertexAI(
@@ -100,15 +100,38 @@ class MultimodalRAG:
                 location=self.location,
                 max_output_tokens=self.token_limit,
                 temperature=0.0,
+                max_retries=2,
+                request_timeout=30,
             )
+            print(" LLM initialized successfully")
         except Exception as e:
-            print(f"Error initializing LLM: {e}")
-            raise
+            print(f"⚠ Primary LLM initialization failed: {e}")
+            # Try with a simpler configuration
+            try:
+                print("Attempting fallback LLM initialization...")
+                self.llm = ChatVertexAI(
+                    model_name="gemini-pro",
+                    project=self.project_id,
+                    location=self.location,
+                    max_output_tokens=2048,
+                    temperature=0.1,
+                    max_retries=1,
+                    request_timeout=20,
+                )
+                print(" Fallback LLM initialized with gemini-pro")
+            except Exception as fallback_error:
+                print(f" Both primary and fallback LLM failed: {fallback_error}")
+                print("⚠ Continuing with degraded functionality (text-only responses)")
+                self.llm = None
         
         # Create the RAG chain
         print("Creating RAG chain...")
-        self._create_rag_chain()
-        print("RAG system initialization complete")
+        if self.llm is not None:
+            self._create_rag_chain()
+            print("RAG system initialization complete")
+        else:
+            self.chain = None
+            print("RAG system initialized with limited functionality (no LLM available)")
     
     def _create_rag_chain(self) -> None:
         """Create the RAG chain with prompt template and model."""
@@ -250,20 +273,76 @@ class MultimodalRAG:
         Returns:
             Dictionary with the answer and optionally the context
         """
-        if self.chain is None:
+        if self.chain is None and self.llm is None:
+            # Initialize but if still no chain, provide fallback
             self.initialize()
-        
-        # Prepare input
-        input_data = {
-            "question": question,
-            "chat_history": chat_history or [],
-        }
-        
-        # Get the answer and context
-        answer = self.chain.invoke(input_data)
+            
+        # Check if we have a working chain
+        if self.chain is None:
+            # Fallback mode: provide context-based response without LLM processing
+            try:
+                context = self.retrieve_documents(question)
+                context_text = "\n".join([doc.page_content[:300] + "..." for doc in context.get('texts', [])[:3]])
+                
+                answer = f"""
+                I found relevant information in the documents, but the AI analysis service is currently unavailable.
+                
+                **Relevant content for your question:** "{question}"
+                
+                {context_text if context_text else 'No specific content found in documents.'}
+                
+                **Note:** This is a basic document search result. Full AI-powered analysis is temporarily unavailable.
+                """
+            except Exception as e:
+                answer = f"I apologize, but both the AI analysis and document search services are currently unavailable. Your question: {question}"
+        else:
+            # Normal operation with LLM chain
+            # Prepare input
+            input_data = {
+                "question": question,
+                "chat_history": chat_history or [],
+            }
+            
+            # Get the answer with robust error handling
+            try:
+                answer = self.chain.invoke(input_data)
+            except Exception as e:
+                error_msg = str(e)
+                print(f"⚠ RAG chain invocation failed: {error_msg}")
+                
+                # Provide a helpful fallback response
+                if "500 Internal error" in error_msg or "Internal Server Error" in error_msg:
+                    # Retrieve context without LLM processing
+                    try:
+                        context = self.retrieve_documents(question)
+                        context_text = "\n".join([doc.page_content[:200] + "..." for doc in context.get('texts', [])[:3]])
+                    except:
+                        context_text = "Unable to retrieve document context."
+                    
+                    answer = f"""
+                    I found relevant information in the documents, but I'm experiencing technical difficulties with the AI analysis service.
+                    
+                    Here's the relevant content I found:
+                    
+                    {context_text if context_text else 'No specific content found in documents.'}
+                    
+                    **Your question:** {question}
+                    
+                    **Note:** The AI analysis system is temporarily unavailable, but the document search and content retrieval is working correctly.
+                    """
+                else:
+                    answer = f"I apologize, but I encountered an error processing your question: {question}. Error details: {error_msg[:100]}..."
+            except KeyboardInterrupt:
+                raise
+            except SystemExit:
+                raise
         
         # Always retrieve context for citations, but only include in response if requested
-        context = self.retrieve_documents(question)
+        try:
+            context = self.retrieve_documents(question)
+        except Exception as e:
+            print(f"⚠ Context retrieval failed: {e}")
+            context = {"texts": [], "images": []}  # Empty fallback context
         
         # Prepare citations from context
         citations = []

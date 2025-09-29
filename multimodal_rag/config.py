@@ -20,8 +20,8 @@ PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT", "")
 LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 
-# Model Configuration
-MODEL_NAME = "gemini-2.0-flash"
+# Model configuration  
+MODEL_NAME = "gemini-1.5-pro"  # Use a more stable model
 EMBEDDING_MODEL_NAME = "text-embedding-005"
 MULTIMODAL_EMBEDDING_MODEL = "multimodalembedding"
 TOKEN_LIMIT = 8192  # Max tokens for Gemini model
