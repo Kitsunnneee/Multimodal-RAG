@@ -2,11 +2,21 @@
 Streamlit UI for Multimodal RAG System with Mem0 Memory
 """
 import os
+import time
+from dotenv import load_dotenv
+load_dotenv()
 import tempfile
 import logging
+import sys
 
-# Set up logging
+# Configure logging to show debug output
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
 logger = logging.getLogger(__name__)
+
 import streamlit as st
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -60,10 +70,14 @@ with st.sidebar:
     if st.button("Initialize/Reset System"):
         with st.spinner("Initializing RAG system..."):
             try:
-                # Initialize RAG system
+                # Initialize RAG system with Pinecone
                 st.session_state.rag_system = MultimodalRAG(
                     model_name=model_name,
-                    token_limit=TOKEN_LIMIT
+                    token_limit=TOKEN_LIMIT,
+                    vector_store_type='pinecone',
+                    pinecone_api_key=os.getenv('PINECONE_API_KEY'),
+                    pinecone_index_name='multimodal-rag',
+                    pinecone_environment='gcp-starter'
                 )
                 
                 # Initialize memory manager if enabled
@@ -440,6 +454,15 @@ if prompt := st.chat_input("Ask a question about your documents..."):
                     error_msg = f"Error generating response: {str(e)}"
                     logger.error(error_msg, exc_info=True)
                     st.error("An error occurred while generating the response. Please try again.")
+
+# Debug Pinecone environment
+logger.info("="*50)
+logger.info("Starting Multimodal RAG Application")
+logger.info("="*50)
+logger.info(f"Python version: {sys.version}")
+logger.info(f"Pinecone API Key: {'*' * 8}{os.getenv('PINECONE_API_KEY', '')[-4:] if os.getenv('PINECONE_API_KEY') else 'Not set'}")
+logger.info(f"Pinecone Environment: {os.getenv('PINECONE_ENVIRONMENT', 'Not set')}")
+logger.info("="*50 + "\n")
 
 # Add some CSS for better styling
 st.markdown("""

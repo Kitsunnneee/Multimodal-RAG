@@ -26,27 +26,52 @@ class MultimodalRAG:
         model_name: str = MODEL_NAME,
         token_limit: int = TOKEN_LIMIT,
         use_gcs: bool = USE_GCS,
+        vector_store_type: str = 'local',  # 'local', 'gcs', or 'pinecone'
+        pinecone_api_key: str = None,
+        pinecone_index_name: str = 'multimodal-rag',
+        pinecone_environment: str = 'gcp-starter',
     ):
         """Initialize the Multimodal RAG system.
         
         Args:
-            project_id: Google Cloud project ID (only used if use_gcs=True)
-            location: Google Cloud region (only used if use_gcs=True)
+            project_id: Google Cloud project ID (used for GCS and Vertex AI)
+            location: Google Cloud region (used for GCS and Vertex AI)
             model_name: Name of the model to use for generation
             token_limit: Maximum number of tokens for model responses
-            use_gcs: Whether to use Google Cloud Storage (False for local storage)
+            use_gcs: Whether to use Google Cloud Storage (legacy, prefer vector_store_type)
+            vector_store_type: Type of vector store to use ('local', 'gcs', or 'pinecone')
+            pinecone_api_key: Pinecone API key (required if vector_store_type is 'pinecone')
+            pinecone_index_name: Name of the Pinecone index
+            pinecone_environment: Pinecone environment
         """
         self.project_id = project_id
         self.location = location
         self.model_name = model_name
         self.token_limit = token_limit
         self.use_gcs = use_gcs
+        self.vector_store_type = vector_store_type.lower()
+        self.pinecone_api_key = pinecone_api_key
+        self.pinecone_index_name = pinecone_index_name
+        self.pinecone_environment = pinecone_environment
         
         # Initialize components
-        self.document_processor = DocumentProcessor()
         self.embedding_manager = None
         self.llm = None
         self.chain = None
+        
+        # Initialize document processor with our embedding manager
+        self.document_processor = DocumentProcessor(embedding_manager=self.embedding_manager)
+        
+        # Reassign embedding manager after initialization to ensure it's the same instance
+        self.embedding_manager = self.document_processor.embedding_manager
+        
+        # Initialize the RAG system
+        try:
+            self.initialize()
+            print("Multimodal RAG system initialized successfully")
+        except Exception as e:
+            print(f"Error initializing Multimodal RAG system: {str(e)}")
+            raise
     
     def initialize(
         self,
@@ -63,16 +88,29 @@ class MultimodalRAG:
         # Initialize embedding manager with appropriate model
         try:
             self.embedding_manager = EmbeddingManager(
-                api_key=os.getenv('GOOGLE_API_KEY'),
                 model_name="text-embedding-004",  # Use the correct embedding model
-                use_vision=False  # We'll handle vision separately
+                use_vision=True,  # Enable vision capabilities
+                api_key=os.getenv('GOOGLE_API_KEY'),
+                vector_store_type=self.vector_store_type,
+                pinecone_api_key=self.pinecone_api_key,
+                pinecone_index_name=self.pinecone_index_name,
+                pinecone_environment=self.pinecone_environment
             )
             
             # Initialize vector store based on storage type
-            if self.use_gcs:
+            if self.vector_store_type == 'pinecone':
+                print(f"Initializing Pinecone vector store with index '{self.pinecone_index_name}'...")
+                self.embedding_manager.initialize_vector_store(
+                    vector_store_type='pinecone',
+                    pinecone_api_key=self.pinecone_api_key or os.getenv('PINECONE_API_KEY'),
+                    pinecone_index_name=self.pinecone_index_name,
+                    pinecone_environment=self.pinecone_environment
+                )
+            elif self.use_gcs or self.vector_store_type == 'gcs':
                 print("Initializing GCS vector store...")
                 # Initialize vector store with existing index and endpoint for GCS
                 self.embedding_manager.initialize_vector_store(
+                    vector_store_type='gcs',
                     project_id=self.project_id,
                     location=self.location,
                     index_id=index_id,
@@ -82,6 +120,7 @@ class MultimodalRAG:
                 print("Initializing local vector store...")
                 # Initialize local vector store
                 self.embedding_manager.initialize_vector_store(
+                    vector_store_type='local',
                     persist_directory=str(Path(__file__).parent.parent / "data" / "vector_store")
                 )
                 
@@ -312,76 +351,104 @@ class MultimodalRAG:
         return response
     
     def add_documents(
-        self,
-        file_path: str,
-        chunk_size: int = 4000,
-        chunk_overlap: int = 200,
-    ) -> Dict[str, List[str]]:
-        """Add documents to the RAG system.
+        self, 
+        file_paths: Union[str, List[str]], 
+        use_llama_parse: bool = False,
+        **kwargs
+    ) -> Dict[str, int]:
+        """Add documents to the vector store.
         
         Args:
-            file_path: Path to the document file
-            chunk_size: Size of text chunks
-            chunk_overlap: Overlap between chunks
+            file_paths: Path or list of paths to documents to add
+            use_llama_parse: Whether to use LlamaParse for document processing
+            **kwargs: Additional arguments to pass to the document processor and vector store
             
         Returns:
             Dictionary with counts of added documents by type
         """
-        if self.embedding_manager is None:
-            self.initialize()
+        if not file_paths:
+            return {"texts": 0, "tables": 0, "images": 0, "total": 0}
+            
+        if isinstance(file_paths, str):
+            file_paths = [file_paths]
+            
+        total_added = 0
+        text_count = 0
+        table_count = 0
+        image_count = 0
         
-        # Process the document
-        elements = self.document_processor.process_file(file_path)
+        for file_path in file_paths:
+            try:
+                print(f"Processing document: {file_path}")
+                # Process the document
+                processed_docs = self.document_processor.process_file(
+                    file_path, 
+                    use_llama_parse=use_llama_parse,
+                    **{k: v for k, v in kwargs.items() if k not in ['pinecone_metadata', 'pinecone_namespace']}
+                )
+                
+                if not processed_docs:
+                    print(f"No content extracted from {file_path}")
+                    continue
+                
+                # Prepare metadata for Pinecone if using Pinecone
+                pinecone_metadata = kwargs.get('pinecone_metadata', {})
+                pinecone_namespace = kwargs.get('pinecone_namespace')
+                
+                # Add file-specific metadata
+                file_metadata = {
+                    'source': file_path,
+                    'file_name': os.path.basename(file_path),
+                    **pinecone_metadata
+                }
+                
+                # Process documents by type (texts, tables, images)
+                documents = []
+                for doc_type in ['texts', 'tables', 'images']:
+                    if doc_type in processed_docs and processed_docs[doc_type]:
+                        for doc in processed_docs[doc_type]:
+                            # Ensure we have a Document object
+                            if isinstance(doc, str):
+                                doc = Document(
+                                    page_content=doc,
+                                    metadata={
+                                        'type': doc_type.rstrip('s'),  # 'texts' -> 'text', 'tables' -> 'table', etc.
+                                        **file_metadata
+                                    }
+                                )
+                            elif hasattr(doc, 'metadata'):
+                                doc.metadata.update(file_metadata)
+                                doc.metadata.setdefault('type', doc_type.rstrip('s'))
+                            
+                            documents.append(doc)
+                            
+                            # Update counts
+                            if doc_type == 'tables':
+                                table_count += 1
+                            elif doc_type == 'images':
+                                image_count += 1
+                            else:
+                                text_count += 1
+                
+                # Add documents to the vector store
+                add_kwargs = {}
+                if self.vector_store_type == 'pinecone' and pinecone_namespace:
+                    add_kwargs['namespace'] = pinecone_namespace
+                
+                doc_ids = self.embedding_manager.add_documents(documents, **add_kwargs)
+                added_count = len(doc_ids)
+                total_added += added_count
+                print(f"Added {added_count} documents from {file_path}")
+                
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+                continue
         
-        try:
-            # Generate summaries for text and tables
-            text_summaries = []
-            if elements["texts"]:
-                try:
-                    text_summaries = self._generate_summaries([doc.page_content for doc in elements["texts"]])
-                except Exception as e:
-                    print(f"Warning: Could not generate text summaries: {e}")
-                    # Use the first 200 characters as a fallback summary
-                    text_summaries = [doc.page_content[:200] + "..." for doc in elements["texts"]]
-            
-            table_summaries = []
-            if elements["tables"]:
-                try:
-                    table_summaries = self._generate_summaries([doc.page_content for doc in elements["tables"]])
-                except Exception as e:
-                    print(f"Warning: Could not generate table summaries: {e}")
-                    # Use the first 200 characters as a fallback summary
-                    table_summaries = [doc.page_content[:200] + "..." for doc in elements["tables"]]
-            
-            # Generate summaries for images
-            image_summaries = []
-            if elements["images"]:
-                try:
-                    # Pass the full document objects to access metadata
-                    image_summaries = self._generate_image_summaries(elements["images"])
-                except Exception as e:
-                    print(f"Warning: Could not generate image summaries: {e}")
-                    image_summaries = ["Image content"] * len(elements["images"])
-            
-            # Combine all documents and summaries
-            all_docs = elements["texts"] + elements["tables"] + elements["images"]
-            all_summaries = text_summaries + table_summaries + image_summaries
-            
-            # Add to vector store
-            doc_ids = self.embedding_manager.add_documents(
-                documents=all_docs,
-                summaries=all_summaries,
-            )
-        except Exception as e:
-            print(f"Error during document processing: {e}")
-            raise
-        
-        # Return counts
         return {
-            "texts": len(elements["texts"]),
-            "tables": len(elements["tables"]),
-            "images": len(elements["images"]),
-            "total": len(doc_ids),
+            "texts": text_count,
+            "tables": table_count,
+            "images": image_count,
+            "total": total_added
         }
     
     def _generate_summaries(self, texts: List[str]) -> List[str]:

@@ -1,7 +1,11 @@
 """Document processing utilities for the Multimodal RAG system."""
+import logging
 import os
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union, Any
+
+# Set up logging
+logger = logging.getLogger(__name__)
 
 import pandas as pd
 from langchain_core.documents import Document
@@ -25,58 +29,93 @@ from .config import (
     MAX_CHARACTERS,
     NEW_AFTER_N_CHARS,
     COMBINE_TEXT_UNDER_N_CHARS,
-    DATA_DIR,
 )
 from .utils import encode_image, is_image_data, split_image_text_types
+from .embeddings import EmbeddingManager
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 
 class DocumentProcessor:
-    """Process documents and extract text, tables, and images."""
+    """Processes different types of documents and extracts their content with support for multimodal data."""
     
     def __init__(
         self, 
-        output_dir: Optional[Union[str, Path]] = None,
-        use_llama_parse: bool = True,
+        embedding_manager: Optional[EmbeddingManager] = None,
+        use_llama_parse: bool = False,
+        output_dir: Optional[str] = None,
         llama_parse_kwargs: Optional[Dict[str, Any]] = None,
+        **embedding_kwargs
     ):
-        """Initialize the document processor.
+        """Initialize the document processor with support for multimodal content.
         
         Args:
-            output_dir: Directory to save extracted images. If None, uses DATA_DIR.
-            use_llama_parse: Whether to use LlamaParse for document parsing
+            embedding_manager: Optional EmbeddingManager instance for generating embeddings.
+                If not provided, will create one with default settings.
+            use_llama_parse: Whether to use LlamaParse for document parsing (default: False)
+            output_dir: Directory to store temporary files (required if use_llama_parse is True)
             llama_parse_kwargs: Additional arguments to pass to LlamaParse
+            **embedding_kwargs: Additional arguments to pass to EmbeddingManager if creating a new instance
         """
-        self.output_dir = Path(output_dir) if output_dir else DATA_DIR
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Initialize LlamaParse if enabled and API key is available
+        if embedding_manager is None:
+            # Create a new EmbeddingManager with vision capabilities enabled by default
+            self.embedding_manager = EmbeddingManager(
+                use_vision=True,
+                **embedding_kwargs
+            )
+        else:
+            self.embedding_manager = embedding_manager
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            length_function=len,
+            is_separator_regex=False
+        )
+        self.supported_image_extensions = ['.jpg', '.jpeg', '.png', '.webp', '.gif']
+        self.supported_video_extensions = ['.mp4', '.mov', '.avi', '.mkv']
         self.use_llama_parse = use_llama_parse
+        self.output_dir = output_dir or os.getcwd()
         self.llama_loader = None
         
-        if use_llama_parse:
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+        )
+        
+        if self.use_llama_parse:
+            if not output_dir:
+                raise ValueError("output_dir must be provided when use_llama_parse is True")
+                
             try:
-                self.llama_loader = LlamaParseLoader(
-                    output_dir=self.output_dir,
+                from llama_parse import LlamaParse
+                self.llama_loader = LlamaParse(
+                    result_type="markdown",
                     **(llama_parse_kwargs or {})
                 )
-                print("LlamaParse initialized successfully")
+                logger.info("LlamaParse initialized successfully")
+            except ImportError:
+                logger.warning("llama-parse package not installed. Install with: pip install llama-parse")
+                self.use_llama_parse = False
             except Exception as e:
-                print(f"Warning: Failed to initialize LlamaParse: {e}")
-                print("Falling back to default parser")
+                logger.error(f"Failed to initialize LlamaParse: {e}")
+                logger.info("Falling back to default parser")
                 self.use_llama_parse = False
     
     def process_file(
         self,
         file_path: Union[str, Path],
+        file_type: Optional[str] = None,
         extract_images: bool = True,
         infer_table_structure: bool = True,
         use_llama_parse: Optional[bool] = None,
         **kwargs,
     ) -> Dict[str, List[Document]]:
-        """Process a file (PDF or image) and extract text and images.
+        """Process a file and extract text, tables, and images.
         
         Args:
-            file_path: Path to the file (PDF or image)
+            file_path: Path to the file to process
+            file_type: Optional file type (e.g., 'pdf', 'txt', 'image', 'video'). 
+                     If None, will be inferred from file extension.
             extract_images: Whether to extract images from the file (for PDFs)
             infer_table_structure: Whether to infer table structure (for PDFs)
             use_llama_parse: Override for using LlamaParse. If None, uses class default.
@@ -93,7 +132,9 @@ class DocumentProcessor:
         if not file_path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
         
-        file_type = file_path.suffix.lower()  # Keep the dot for consistency
+        # Determine file type if not provided
+        if file_type is None:
+            file_type = file_path.suffix.lower()
         
         # Initialize result dictionary
         result = {
@@ -102,9 +143,12 @@ class DocumentProcessor:
             "images": []
         }
         
+        # Handle metadata
+        metadata = kwargs.get('metadata', {})
+        
         # Use LlamaParse if enabled and available for this file type
         use_llama = use_llama_parse if use_llama_parse is not None else self.use_llama_parse
-        if use_llama and self.llama_loader and file_type in ['.pdf', '.docx', '.pptx', '.xlsx']:
+        if use_llama and self.llama_loader and file_type.lstrip('.') in ['pdf', 'docx', 'pptx', 'xlsx']:
             try:
                 # Remove the dot for the file_type parameter since LlamaParse expects it without dot
                 documents = self.llama_loader.load_file(file_path, file_type=file_type.lstrip('.'), **kwargs)
@@ -119,19 +163,19 @@ class DocumentProcessor:
         if file_type == '.pdf':
             return self._process_pdf(
                 file_path, 
-                extract_images=kwargs.get('extract_images', True),
-                infer_table_structure=kwargs.get('infer_table_structure', True)
+                extract_images=extract_images,
+                infer_table_structure=infer_table_structure
             )
         elif file_type in ['.pptx', '.ppt']:
-            return self._process_pptx(file_path)
+            return self._process_pptx(file_path, metadata)
         elif file_type in ['.xlsx', '.xls']:
-            return self._process_excel(file_path)
+            return self._process_excel(file_path, metadata)
         elif file_type == '.csv':
             return self._process_csv(file_path)
         elif file_type in ['.txt', '.md', '.markdown']:
             return self._process_text(file_path)
         elif file_type in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif']:
-            return self._process_image(file_path)
+            return self._process_image(file_path, metadata)
         else:
             # Try with unstructured loader as fallback
             try:
@@ -145,64 +189,130 @@ class DocumentProcessor:
                     ".png, .jpg, .jpeg, .tiff, .bmp, .gif"
                 )
     
-    def _process_image(self, file_path: Path) -> Dict[str, List[Document]]:
-        """Process an image file and extract text.
+    def _process_image(self, file_path: Union[str, Path], metadata: Optional[Dict] = None) -> Dict[str, List[Document]]:
+        """Process an image file to extract text and generate embeddings.
         
         Args:
             file_path: Path to the image file
+            metadata: Optional metadata to include with the document
             
         Returns:
-            Dictionary containing 'texts' and empty 'tables' and 'images' lists
+            Dictionary containing 'texts' with the processed image document
         """
-        from .utils import encode_image, extract_text_from_image
-        import os
+        from PIL import Image
+        import base64
+        import io
         
         try:
-            # Encode image to base64
-            b64_image = encode_image(file_path)
+            # Read and encode image
+            with open(file_path, 'rb') as img_file:
+                b64_image = base64.b64encode(img_file.read()).decode('utf-8')
             
-            # Get the service account path from environment or use default location
-            service_account_path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
-            if not service_account_path or not os.path.exists(service_account_path):
-                service_account_path = os.path.join(
-                    os.path.dirname(os.path.dirname(__file__)), 
-                    'elite-thunder-461308-f7-cc85c56bb209.json'
-                )
+            # Generate image description using Gemini
+            image_description = self._generate_image_description(file_path)
             
-            if not os.path.exists(service_account_path):
-                raise FileNotFoundError(
-                    f"Service account file not found at {service_account_path}. "
-                    "Please set the GOOGLE_APPLICATION_CREDENTIALS environment variable "
-                    "to point to your service account JSON file."
-                )
+            # Extract text using OCR
+            extracted_text = self._extract_text_with_ocr(file_path)
             
-            # Extract text using OCR with Gemini API
-            extracted_text = extract_text_from_image(
-                b64_image,
-                service_account_path=service_account_path
-            )
+            # Combine description and OCR text
+            combined_text = f"""Image Description: {image_description}
             
-            if not extracted_text:
-                print(f"Warning: No text could be extracted from {file_path}")
-                return {"texts": [], "tables": [], "images": []}
+            Extracted Text:
+            {extracted_text}"""
             
-            # Store the base64-encoded image in the document content
-            # along with the extracted text for better retrieval
-            doc = Document(
-                page_content=f"[IMAGE] {extracted_text}",
-                metadata={
+            # Generate embeddings
+            try:
+                # Generate image embedding
+                image = Image.open(file_path)
+                image_embedding = self.embedding_manager.embeddings.embed_image(image)
+                
+                # Generate text embedding
+                text_embedding = self.embedding_manager.embeddings.embed_documents([combined_text])[0]
+                
+                # Create document with all metadata
+                doc_metadata = {
                     "source": str(file_path),
-                    "page": 0,
                     "type": "image",
-                    "original_content": extracted_text,
-                    "image_data": b64_image  # Store the base64-encoded image data
+                    "description": image_description,
+                    "extracted_text": extracted_text,
+                    "image_embedding": image_embedding,
+                    "text_embedding": text_embedding,
+                    "has_image": True,
+                    "image_data": b64_image  # Store base64 for display
                 }
-            )
+                
+                if metadata:
+                    doc_metadata.update(metadata)
+                
+                doc = Document(
+                    page_content=combined_text,
+                    metadata=doc_metadata
+                )
+                
+                return {"texts": [doc], "tables": [], "images": [doc]}
+                
+            except Exception as e:
+                logger.error(f"Error generating embeddings: {e}")
+                # Return document without embeddings
+                doc = Document(
+                    page_content=combined_text,
+                    metadata={
+                        "source": str(file_path),
+                        "type": "image",
+                        "description": image_description,
+                        "extracted_text": extracted_text,
+                        "error": str(e),
+                        "has_image": True,
+                        "image_data": b64_image
+                    }
+                )
+                return {"texts": [doc], "tables": [], "images": [doc]}
+                
+        except Exception as e:
+            logger.error(f"Error processing image {file_path}: {e}")
+            return {"texts": [], "tables": [], "images": []}
+    
+    def _generate_image_description(self, image_path: Union[str, Path]) -> str:
+        """Generate a description of the image using Gemini."""
+        try:
+            import google.generativeai as genai
             
-            return {"texts": [doc], "tables": [], "images": [doc]}
+            # Initialize Gemini
+            genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
+            model = genai.GenerativeModel('gemini-pro-vision')
+            
+            # Load image
+            img = Image.open(image_path)
+            
+            # Generate description
+            response = model.generate_content(["Describe this image in detail, including any text, objects, and their relationships.", img])
+            
+            return response.text
             
         except Exception as e:
-            print(f"Error processing image {file_path}: {e}")
+            logger.warning(f"Error generating image description: {e}")
+            return "[No description available]"
+    
+    def _extract_text_with_ocr(self, image_path: Union[str, Path]) -> str:
+        """Extract text from image using Tesseract OCR."""
+        try:
+            import pytesseract
+            from PIL import Image
+            
+            # Open image
+            img = Image.open(image_path)
+            
+            # Extract text
+            text = pytesseract.image_to_string(img)
+            
+            return text.strip() if text else "[No text could be extracted]"
+            
+        except Exception as e:
+            logger.warning(f"Error extracting text with OCR: {e}")
+            return "[Text extraction failed]"
+            
+        except Exception as e:
+            logger.error(f"Error processing image {file_path}: {e}", exc_info=True)
             # Return empty results on error
             return {"texts": [], "tables": [], "images": []}
     
@@ -307,75 +417,63 @@ class DocumentProcessor:
         infer_table_structure: bool = True,
     ) -> Dict[str, List[Document]]:
         """Process a PDF file and extract text, tables, and images."""
-        from unstructured.partition.pdf import partition_pdf
-        from .config import MAX_CHARACTERS, NEW_AFTER_N_CHARS, COMBINE_TEXT_UNDER_N_CHARS
+        from PyPDF2 import PdfReader
+        from pdf2image import convert_from_path
+        import tempfile
+        import os
         
         try:
             # Ensure output directory exists
             self.output_dir.mkdir(parents=True, exist_ok=True)
             
-            # Extract elements from PDF with error handling
+            # First, extract text using PyPDF2
+            text = ""
             try:
-                elements = partition_pdf(
-                    filename=str(file_path),
-                    extract_images_in_pdf=extract_images,
-                    infer_table_structure=infer_table_structure,
-                    chunking_strategy="by_title",
-                    max_characters=MAX_CHARACTERS,
-                    new_after_n_chars=NEW_AFTER_N_CHARS,
-                    combine_text_under_n_chars=COMBINE_TEXT_UNDER_N_CHARS,
-                    image_output_dir_path=str(self.output_dir),
-                )
+                with open(file_path, 'rb') as f:
+                    pdf_reader = PdfReader(f)
+                    for page in pdf_reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n\n"
             except Exception as e:
-                raise ValueError(f"Failed to process PDF: {str(e)}") from e
+                logger.warning(f"Error extracting text with PyPDF2: {e}")
             
-            # Categorize elements with type checking
-            texts = []
-            tables = []
-            
-            for element in elements:
-                try:
-                    element_str = str(element or '').strip()
-                    if not element_str:
-                        continue
-                        
-                    element_type = str(type(element))
-                    if "Table" in element_type:
-                        tables.append(element_str)
-                    elif any(t in element_type for t in ["CompositeElement", "Text"]):
-                        texts.append(element_str)
-                except Exception as e:
-                    print(f"Warning: Error processing element: {e}")
-                    continue
-            
-            # Convert to Documents with content validation
-            text_docs = [Document(page_content=text) for text in texts if text and len(text) > 10]
-            table_docs = [Document(page_content=table) for table in tables if table]
-            
-            # Process images if any were extracted
+            # Process images if needed
             image_docs = []
             if extract_images:
-                image_files = list(self.output_dir.glob("*.png")) + list(self.output_dir.glob("*.jpg"))
-                for img_path in image_files:
-                    try:
-                        if img_path.stat().st_size == 0:
+                try:
+                    # Convert PDF pages to images
+                    images = convert_from_path(file_path)
+                    temp_dir = tempfile.mkdtemp()
+                    
+                    for i, image in enumerate(images):
+                        img_path = os.path.join(temp_dir, f"page_{i+1}.jpg")
+                        image.save(img_path, 'JPEG')
+                        
+                        # Process each image
+                        try:
+                            img_doc = self._process_image(img_path, {"source": str(file_path), "page": i+1})
+                            if img_doc and "texts" in img_doc and img_doc["texts"]:
+                                image_docs.extend(img_doc["texts"])
+                        except Exception as e:
+                            logger.warning(f"Error processing image from PDF page {i+1}: {e}")
                             continue
-                        b64_image = encode_image(img_path)
-                        if b64_image and len(b64_image) > 100:  # Basic validation
-                            image_docs.append(Document(
-                                page_content=b64_image, 
-                                metadata={"source": str(img_path.name)}
-                            ))
-                        # Clean up the image file after processing
-                        img_path.unlink(missing_ok=True)
-                    except Exception as e:
-                        print(f"Warning: Error processing image {img_path}: {e}")
-                        continue
+                            
+                except Exception as e:
+                    logger.warning(f"Error extracting images from PDF: {e}")
+            
+            # Create text document if we have text
+            text_docs = []
+            if text.strip():
+                text_docs = [Document(
+                    page_content=text,
+                    metadata={"source": str(file_path), "type": "pdf_text"}
+                )]
             
             return {
                 "texts": text_docs,
-                "tables": table_docs,
-                "images": image_docs,
+                "tables": [],  # Tables are included in text extraction
+                "images": image_docs
             }
             
         except Exception as e:
@@ -450,56 +548,164 @@ class DocumentProcessor:
         
         return documents
 
-    def _process_file(
-        self, 
-        file_path: Union[str, Path],
-        file_type: Optional[str] = None,
-        extra_info: Optional[Dict[str, Any]] = None,
-    ) -> List[Document]:
-        """Process a single file and return a list of documents.
+    def _get_file_type(self, file_path: str) -> str:
+        """Get the file type from the file extension."""
+        return os.path.splitext(file_path)[1].lower()
+        
+    def _is_image_file(self, file_path: str) -> bool:
+        """Check if the file is an image based on its extension."""
+        file_ext = self._get_file_type(file_path)
+        return file_ext in self.supported_image_extensions
+            
+    def _extract_text_from_image(self, image_path: Union[str, Path]) -> str:
+        """Extract text from an image using OCR.
         
         Args:
-            file_path: Path to the file to process
-            file_type: Type of the file (pdf, docx, pptx, xlsx, etc.)
-            extra_info: Additional metadata to include in the documents
+            image_path: Path to the image file
             
         Returns:
-            List of Document objects
+            Extracted text from the image
+            
+        Raises:
+            ImportError: If required OCR libraries are not installed
+            RuntimeError: If text extraction fails
         """
-        file_path = Path(file_path)
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-            
-        # Detect file type if not provided
-        if not file_type:
-            file_type, _ = get_file_type(file_path)
-        
-        # Use LlamaParse if available and not disabled
-        if self.use_llama_parse and self.llama_loader and file_type in ('pdf', 'docx'):
+        try:
+            # Try using pytesseract if available
             try:
-                return self.llama_loader.load_file(
-                    file_path, 
-                    file_type=file_type,
-                    extra_info=extra_info
-                )
-            except Exception as e:
-                print(f"Error using LlamaParse: {e}. Falling back to local processing.")
-        
-        # Process based on file type
-        if not is_supported_file(file_path):
-            raise ValueError(f"Unsupported file type: {file_type}")
-            
-        if file_type == 'pdf':
-            return self._process_pdf(file_path, extra_info=extra_info)
-        elif file_type == 'docx':
-            return self._process_docx(file_path, extra_info=extra_info)
-        elif file_type == 'pptx':
-            return self._process_pptx(file_path, extra_info=extra_info)
-        elif file_type == 'xlsx':
-            return self._process_xlsx(file_path, extra_info=extra_info)
+                import pytesseract
+                from PIL import Image
+                
+                # Open the image
+                img = Image.open(image_path)
+                
+                # Convert to grayscale for better OCR results
+                img = img.convert('L')
+                
+                # Use pytesseract to extract text
+                text = pytesseract.image_to_string(img)
+                
+                # Clean up the extracted text
+                if text:
+                    text = ' '.join(line.strip() for line in text.split('\n') if line.strip())
+                
+                return text if text else ""
+                
+            except ImportError:
+                logger.warning("pytesseract not available, trying easyocr...")
+                
+            # Fall back to easyocr if available
+            try:
+                import easyocr
+                
+                # Initialize the OCR reader
+                reader = easyocr.Reader(['en'])
+                
+                # Read the image
+                result = reader.readtext(str(image_path))
+                
+                # Extract and join the text
+                text = ' '.join([item[1] for item in result])
+                
+                return text if text else ""
+                
+            except ImportError:
+                logger.warning("easyocr not available, no OCR will be performed")
+                return ""
+                
+        except Exception as e:
+            logger.warning(f"Error extracting text from image: {str(e)}")
+            return ""
+    
+    def _get_content_type(self, file_path: str, file_ext: str) -> str:
+        """Determine the content type of the file."""
+        if self._is_image_file(file_path):
+            return 'image'
+        elif self._is_video_file(file_path):
+            return 'video'
+        elif file_ext == '.pdf':
+            return 'document'
+        elif file_ext in ['.docx', '.doc']:
+            return 'document'
+        elif file_ext in ['.pptx', '.ppt']:
+            return 'presentation'
+        elif file_ext in ['.xlsx', '.xls', '.csv']:
+            return 'spreadsheet'
         else:
-            # Default to text processing
-            return self._process_text_file(file_path, extra_info=extra_info)
+            return 'text'
+            
+    def _process_image(self, file_path: Union[str, Path], metadata: Dict[str, Any]) -> List[Document]:
+        """Process an image file and extract text and visual features with multimodal embeddings.
+        
+        Args:
+            file_path: Path to the image file
+            metadata: Metadata to include with the document
+            
+        Returns:
+            List containing a single Document with image content and embeddings
+            
+        Raises:
+            ValueError: If the image cannot be processed
+        """
+        try:
+            from PIL import Image
+            import base64
+            from io import BytesIO
+            
+            # Load and preprocess the image
+            try:
+                image = Image.open(file_path).convert('RGB')
+                # Resize if needed to reduce memory usage
+                max_size = (1024, 1024)
+                image.thumbnail(max_size, Image.Resampling.LANCZOS)
+            except Exception as e:
+                raise ValueError(f"Failed to load image {file_path}: {str(e)}")
+            
+            # Generate image embedding
+            try:
+                image_embedding = self.embedding_manager.embed_image(image)[0]
+            except Exception as e:
+                logger.warning(f"Could not generate image embedding: {str(e)}")
+                image_embedding = None
+            
+            # Extract text from image using OCR if needed
+            text = ""
+            try:
+                text = self._extract_text_from_image(file_path)
+            except Exception as e:
+                logger.warning(f"Could not extract text from image: {str(e)}")
+            
+            # Prepare image data for storage
+            buffered = BytesIO()
+            image.save(buffered, format="JPEG", quality=85)
+            img_str = base64.b64encode(buffered.getvalue()).decode('utf-8')
+            
+            # Create document with both text and image data
+            doc_metadata = {
+                **metadata,
+                'embedding': image_embedding,
+                'content_type': 'image',
+                'has_image': True,
+                'image_data': img_str,
+                'image_format': 'jpeg',
+                'image_size': os.path.getsize(file_path),
+                'image_dimensions': f"{image.width}x{image.height}"
+            }
+            
+            # Add text if available
+            if text.strip():
+                doc_metadata['extracted_text'] = text
+            
+            doc = Document(
+                page_content=text or "[Image content]" + (f"\nDetected text: {text}" if text else ""),
+                metadata=doc_metadata
+            )
+            
+            return [doc]
+                
+        except Exception as e:
+            logger.error(f"Error processing image {file_path}: {str(e)}", exc_info=True)
+            raise ValueError(f"Failed to process image {file_path}: {str(e)}")
 
 
 def generate_summaries(
