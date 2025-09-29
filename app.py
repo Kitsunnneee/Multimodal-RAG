@@ -3,6 +3,10 @@ Streamlit UI for Multimodal RAG System with Mem0 Memory
 """
 import os
 import tempfile
+import logging
+
+# Set up logging
+logger = logging.getLogger(__name__)
 import streamlit as st
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -55,18 +59,64 @@ with st.sidebar:
     # Initialize/Reset button
     if st.button("Initialize/Reset System"):
         with st.spinner("Initializing RAG system..."):
-            st.session_state.rag_system = MultimodalRAG(
-                model_name=model_name,
-                token_limit=TOKEN_LIMIT
-            )
-            
-            if use_memory:
-                st.session_state.memory_manager = MemoryManager(
-                    collection_name=memory_collection,
-                    use_hosted=False  # Set to True if using hosted Mem0
+            try:
+                # Initialize RAG system
+                st.session_state.rag_system = MultimodalRAG(
+                    model_name=model_name,
+                    token_limit=TOKEN_LIMIT
                 )
-            
-            st.success("RAG system initialized successfully!")
+                
+                # Initialize memory manager if enabled
+                if use_memory:
+                    # Get the MEM0_API_KEY from environment
+                    mem0_api_key = os.environ.get("MEM0_API_KEY")
+                    if not mem0_api_key:
+                        st.warning("MEM0_API_KEY environment variable not set. Memory features will be disabled.")
+                        use_memory = False
+                    else:
+                        try:
+                            # Import MemoryClient
+                            from mem0 import MemoryClient
+                            
+                            # Initialize MemoryClient with the API key
+                            st.session_state.memory_manager = MemoryClient(api_key=mem0_api_key)
+                            
+                            # Store user ID in session state if not already set
+                            if "user_id" not in st.session_state:
+                                st.session_state.user_id = "default_user"
+                            
+                            # Test the connection with a simple operation
+                            test_result = st.session_state.memory_manager.add(
+                                messages=[{"role": "system", "content": "Memory initialized successfully"}],
+                                user_id=st.session_state.user_id
+                            )
+                            
+                            # Check if test_result is not None and has a 'results' key
+                            if test_result is not None and 'results' in test_result:
+                                st.session_state.memory_initialized = True
+                                logger.info("Memory system initialized successfully")
+                                logger.debug(f"Memory test result: {test_result}")
+                            else:
+                                # If we get here, the test failed
+                                logger.warning(f"Memory test returned unexpected response: {test_result}")
+                                # Still continue with memory enabled, as the API might work even if test is flaky
+                                st.session_state.memory_initialized = True
+                                st.warning("Memory test was inconclusive, but continuing with memory enabled")
+                            
+                        except ImportError as ie:
+                            st.error(f"Failed to import mem0 package: {str(ie)}")
+                            logger.error(f"Failed to import mem0 package: {str(ie)}")
+                            use_memory = False
+                        except Exception as e:
+                            st.error(f"Failed to initialize memory: {str(e)}")
+                            logger.error(f"Memory initialization failed: {str(e)}", exc_info=True)
+                            use_memory = False
+                
+                st.success("RAG system initialized successfully!")
+                
+            except Exception as e:
+                st.error(f"Failed to initialize RAG system: {str(e)}")
+                logger.error(f"RAG system initialization failed: {str(e)}", exc_info=True)
 
 # Main content
 st.title("🤖 Multimodal RAG Chat")
@@ -75,9 +125,30 @@ st.caption("Upload documents and chat with them using the power of multimodal RA
 # File uploader
 st.subheader("📂 Upload Documents")
 uploaded_files = st.file_uploader(
-    "Upload PDFs, images, or text files",
-    type=["pdf", "png", "jpg", "jpeg", "txt", "csv", "xlsx"],
-    accept_multiple_files=True
+    "Upload documents, presentations, spreadsheets, or images",
+    type=[
+        # Documents
+        "pdf", "txt", "md", "html", "rtf",
+        # Office Documents
+        "docx", "doc", "odt", "ott",
+        # Spreadsheets
+        "xlsx", "xls", "xlsm", "xlsb", "ods", "ots",
+        # Presentations
+        "pptx", "ppt", "odp", "otp",
+        # Images
+        "png", "jpg", "jpeg", "tiff", "bmp", "gif", "webp",
+        # Data
+        "csv", "tsv", "json", "xml", "yaml", "yml"
+    ],
+    accept_multiple_files=True,
+    help="""
+    Supported formats:
+    - Documents: PDF, TXT, MD, HTML, DOCX, DOC, ODT
+    - Spreadsheets: XLSX, XLS, XLSM, ODS
+    - Presentations: PPTX, PPT, ODP
+    - Images: PNG, JPG, JPEG, TIFF, BMP, GIF, WEBP
+    - Data: CSV, TSV, JSON, XML, YAML
+    """
 )
 
 # Process uploaded files
@@ -87,13 +158,20 @@ if uploaded_files and st.button("Process Documents"):
     else:
         with st.spinner("Processing documents..."):
             temp_dir = Path(tempfile.mkdtemp())
+            processed_count = 0
             
-            for uploaded_file in uploaded_files:
-                file_path = temp_dir / uploaded_file.name
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            for i, uploaded_file in enumerate(uploaded_files):
                 try:
+                    file_path = temp_dir / uploaded_file.name
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded_file.getbuffer())
+                    
+                    # Update status
+                    status_text.text(f"Processing {i+1}/{len(uploaded_files)}: {uploaded_file.name}")
+                    
                     # Add the document to the RAG system
                     result = st.session_state.rag_system.add_documents(
                         str(file_path),
@@ -105,19 +183,49 @@ if uploaded_files and st.button("Process Documents"):
                     st.session_state.uploaded_files.append({
                         "name": uploaded_file.name,
                         "type": uploaded_file.type,
-                        "size": len(uploaded_file.getvalue())
+                        "size": len(uploaded_file.getvalue()),
+                        "chunks": result.get("texts", 0) + result.get("tables", 0) + result.get("images", 0)
                     })
                     
+                    processed_count += 1
+                    
                 except Exception as e:
-                    st.error(f"Error processing {uploaded_file.name}: {str(e)}")
+                    st.error(f"Error processing {uploaded_file.name if 'uploaded_file' in locals() else 'file'}: {str(e)}")
+                
+                # Update progress
+                progress_bar.progress((i + 1) / len(uploaded_files))
             
-            st.success(f"Processed {len(uploaded_files)} documents!")
+            status_text.empty()
+            progress_bar.empty()
+            
+            if processed_count > 0:
+                st.success(f"Successfully processed {processed_count} out of {len(uploaded_files)} documents!")
+            else:
+                st.warning("No documents were processed successfully. Please check the error messages above.")
 
 # Display uploaded files
 if st.session_state.uploaded_files:
     st.subheader("📝 Uploaded Documents")
+    
+    # Create a table for better organization
+    cols = st.columns([4, 2, 2, 2])
+    with cols[0]: st.markdown("**File Name**")
+    with cols[1]: st.markdown("**Type**")
+    with cols[2]: st.markdown("**Size**")
+    with cols[3]: st.markdown("**Chunks**")
+    
     for file_info in st.session_state.uploaded_files:
-        st.write(f"- {file_info['name']} ({file_info['type']}, {file_info['size']/1024:.1f} KB)")
+        cols = st.columns([4, 2, 2, 2])
+        with cols[0]: st.text(file_info['name'])
+        with cols[1]: st.text(file_info['type'].split('/')[-1].upper())
+        with cols[2]: st.text(f"{file_info['size']/1024:.1f} KB")
+        with cols[3]: st.text(file_info.get('chunks', 'N/A'))
+    
+    # Add a button to clear all uploaded files
+    if st.button("Clear All Documents", type="secondary"):
+        st.session_state.uploaded_files = []
+        st.session_state.chat_history = []
+        st.rerun()
 
 # Chat interface
 st.subheader("💬 Chat with your documents")
@@ -163,10 +271,15 @@ for message in st.session_state.chat_history:
                                 source_path = Path(citation['source'])
                                 if source_path.exists():
                                     with open(source_path, "rb") as f:
+                                        # Create a unique key for each download button using file name, index, and timestamp
+                                        import time
+                                        timestamp = int(time.time() * 1000)  # Current time in milliseconds
+                                        button_key = f"download_{source_path.stem}_{i}_{timestamp}"
                                         st.download_button(
                                             label="View Source",
                                             data=f,
                                             file_name=source_path.name,
+                                            key=button_key,
                                             mime="application/octet-stream",
                                             use_container_width=True
                                         )
@@ -197,8 +310,8 @@ if prompt := st.chat_input("Ask a question about your documents..."):
                         return_context=True
                     )
                     
-                    # Display response
-                    st.write(response["answer"])
+                    # Create a placeholder for the response
+                    response_placeholder = st.empty()
                     
                     # Format citations for display
                     formatted_citations = []
@@ -207,40 +320,126 @@ if prompt := st.chat_input("Ask a question about your documents..."):
                             "type": citation.get("type", "text"),
                             "display_text": citation.get("display_text", ""),
                             "source": citation.get("source", ""),
-                            "page": citation.get("page", "")
+                            "page": citation.get("page", ""),
+                            "content": citation.get("content", ""),
+                            "image_path": citation.get("image_path", "")
                         }
-                        
-                        # Add type-specific fields
-                        if formatted_citation["type"] == "image":
-                            formatted_citation["image_path"] = citation.get("image_path", "")
-                        else:
-                            formatted_citation["content"] = citation.get("content", "")
-                        
                         formatted_citations.append(formatted_citation)
                     
                     # Add to chat history with formatted citations
-                    st.session_state.chat_history.append({
+                    assistant_message = {
                         "role": "assistant",
                         "content": response["answer"],
-                        "citations": formatted_citations
-                    })
+                        "citations": formatted_citations,
+                        "timestamp": time.time()
+                    }
+                    st.session_state.chat_history.append(assistant_message)
+                    
+                    # Display the response with citations
+                    with response_placeholder.container():
+                        st.write(response["answer"])
+                        
+                        # Display citations if available
+                        if formatted_citations:
+                            with st.expander(f"📚 Sources ({len(formatted_citations)})", expanded=True):
+                                for i, citation in enumerate(formatted_citations, 1):
+                                    with st.container():
+                                        st.markdown(f"### Source {i}")
+                                        
+                                        # Display source information
+                                        col1, col2 = st.columns([1, 3])
+                                        
+                                        with col1:
+                                            # Show icon based on source type
+                                            if citation.get('type') == 'image':
+                                                st.markdown("🖼️ **Image Source")
+                                                if citation.get('image_path'):
+                                                    try:
+                                                        st.image(citation['image_path'], use_column_width=True)
+                                                    except Exception as e:
+                                                        st.warning("Could not load image")
+                                            else:
+                                                st.markdown("📄 **Text Source")
+                                        
+                                        with col2:
+                                            # Display source metadata
+                                            if citation.get('display_text'):
+                                                st.markdown(f"**{citation['display_text']}**")
+                                            
+                                            # Show content preview for text sources
+                                            if citation.get('content'):
+                                                with st.expander("View content"):
+                                                    st.markdown(citation['content'])
+                                            
+                                            # Add a download/view button for the source
+                                            if citation.get('source'):
+                                                source_path = Path(citation['source'])
+                                                if source_path.exists():
+                                                    with open(source_path, "rb") as f:
+                                                        button_key = f"download_{source_path.stem}_{i}_{int(time.time()*1000)}"
+                                                        st.download_button(
+                                                            label="View Source",
+                                                            data=f,
+                                                            file_name=source_path.name,
+                                                            key=button_key,
+                                                            use_container_width=True
+                                                        )
                     
                     # Update memory if enabled
-                    if use_memory and st.session_state.memory_manager:
-                        # Combine user input and AI response for memory
-                        memory_content = f"User: {prompt}\nAssistant: {response['answer']}"
-                        st.session_state.memory_manager.add_memory(
-                            content=memory_content,
-                            metadata={
+                    if use_memory and hasattr(st.session_state, 'memory_manager') and st.session_state.memory_manager:
+                        try:
+                            # Prepare messages for Mem0
+                            messages = [
+                                {"role": "user", "content": prompt},
+                                {"role": "assistant", "content": response["answer"]}
+                            ]
+                            
+                            # Prepare metadata
+                            memory_metadata = {
                                 "source": "chat",
-                                "citations": response.get("citations", []),
                                 "user_input": prompt,
                                 "ai_response": response["answer"]
                             }
-                        )
-                    
+                            
+                            # Add citations to metadata if they exist
+                            if "citations" in response and response["citations"]:
+                                try:
+                                    # Convert citations to a serializable format if needed
+                                    memory_metadata["citations"] = response["citations"]
+                                except Exception as e:
+                                    logger.warning(f"Could not add citations to memory: {str(e)}")
+                            
+                            # Get user ID
+                            user_id = st.session_state.get("user_id", "default_user")
+                            
+                            # Add to memory using the MemoryClient
+                            try:
+                                result = st.session_state.memory_manager.add(
+                                    messages=messages,
+                                    user_id=user_id,
+                                    metadata=memory_metadata,
+                                    infer=True,  # Let Mem0 infer and extract entities
+                                    output_format='v1.1'  # Use the latest version
+                                )
+                                
+                                # In v1.1, a successful addition returns results with the memory ID
+                                if result and 'results' in result and isinstance(result['results'], list):
+                                    logger.info(f"Successfully added to memory. Result: {result}")
+                                else:
+                                    logger.warning(f"Memory addition returned unexpected response: {result}")
+                                    
+                            except Exception as e:
+                                logger.error(f"Error adding to memory: {str(e)}", exc_info=True)
+                                
+                        except Exception as e:
+                            error_msg = f"Failed to handle memory: {str(e)}"
+                            logger.error(error_msg, exc_info=True)
+                            st.warning("Failed to save conversation to memory")
+                
                 except Exception as e:
-                    st.error(f"Error generating response: {str(e)}")
+                    error_msg = f"Error generating response: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    st.error("An error occurred while generating the response. Please try again.")
 
 # Add some CSS for better styling
 st.markdown("""
