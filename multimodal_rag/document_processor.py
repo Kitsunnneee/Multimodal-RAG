@@ -11,6 +11,13 @@ from unstructured.partition.pdf import partition_pdf
 
 from .llama_parse_loader import LlamaParseLoader
 from .file_utils import get_file_type, is_supported_file
+from langchain_community.document_loaders import (
+    UnstructuredPowerPointLoader,
+    UnstructuredExcelLoader,
+    CSVLoader,
+    TextLoader,
+    UnstructuredFileLoader
+)
 
 from .config import (
     CHUNK_SIZE,
@@ -115,10 +122,28 @@ class DocumentProcessor:
                 extract_images=kwargs.get('extract_images', True),
                 infer_table_structure=kwargs.get('infer_table_structure', True)
             )
+        elif file_type in ['.pptx', '.ppt']:
+            return self._process_pptx(file_path)
+        elif file_type in ['.xlsx', '.xls']:
+            return self._process_excel(file_path)
+        elif file_type == '.csv':
+            return self._process_csv(file_path)
+        elif file_type in ['.txt', '.md', '.markdown']:
+            return self._process_text(file_path)
         elif file_type in ['.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif']:
             return self._process_image(file_path)
         else:
-            raise ValueError(f"Unsupported file type: {file_type}. Supported types: .pdf, .png, .jpg, .jpeg, .tiff, .bmp, .gif")
+            # Try with unstructured loader as fallback
+            try:
+                loader = UnstructuredFileLoader(str(file_path))
+                docs = loader.load()
+                return {"texts": docs, "tables": [], "images": []}
+            except Exception as e:
+                raise ValueError(
+                    f"Unsupported file type: {file_type}. "
+                    "Supported types: .pdf, .pptx, .ppt, .xlsx, .xls, .csv, .txt, "
+                    ".png, .jpg, .jpeg, .tiff, .bmp, .gif"
+                )
     
     def _process_image(self, file_path: Path) -> Dict[str, List[Document]]:
         """Process an image file and extract text.
@@ -179,6 +204,100 @@ class DocumentProcessor:
         except Exception as e:
             print(f"Error processing image {file_path}: {e}")
             # Return empty results on error
+            return {"texts": [], "tables": [], "images": []}
+    
+    def _process_pptx(self, file_path: Path) -> Dict[str, List[Document]]:
+        """Process a PowerPoint file and extract text and slides.
+        
+        Args:
+            file_path: Path to the PowerPoint file
+            
+        Returns:
+            Dictionary containing 'texts' and empty 'tables' and 'images' lists
+        """
+        try:
+            loader = UnstructuredPowerPointLoader(str(file_path))
+            docs = loader.load()
+            return {"texts": docs, "tables": [], "images": []}
+        except Exception as e:
+            print(f"Error processing PowerPoint file {file_path}: {e}")
+            return {"texts": [], "tables": [], "images": []}
+    
+    def _process_excel(self, file_path: Path) -> Dict[str, List[Document]]:
+        """Process an Excel file and extract data from all sheets.
+        
+        Args:
+            file_path: Path to the Excel file
+            
+        Returns:
+            Dictionary containing 'texts' (for sheet data) and 'tables' (for structured data)
+        """
+        try:
+            # First try with UnstructuredExcelLoader
+            loader = UnstructuredExcelLoader(str(file_path), mode="elements")
+            docs = loader.load()
+            
+            # Separate text and tables
+            texts = []
+            tables = []
+            
+            for doc in docs:
+                if doc.metadata.get("category") == "Table":
+                    tables.append(doc)
+                else:
+                    texts.append(doc)
+            
+            return {"texts": texts, "tables": tables, "images": []}
+            
+        except Exception as e:
+            print(f"Error processing Excel file {file_path}: {e}")
+            return {"texts": [], "tables": [], "images": []}
+    
+    def _process_csv(self, file_path: Path) -> Dict[str, List[Document]]:
+        """Process a CSV file and extract data.
+        
+        Args:
+            file_path: Path to the CSV file
+            
+        Returns:
+            Dictionary containing 'texts' with CSV data
+        """
+        try:
+            # First try with pandas for better handling of various CSV formats
+            try:
+                import pandas as pd
+                df = pd.read_csv(file_path, nrows=1000)  # Read first 1000 rows
+                text = df.to_string()
+                doc = Document(
+                    page_content=text,
+                    metadata={"source": str(file_path), "type": "csv"}
+                )
+                return {"texts": [doc], "tables": [], "images": []}
+            except Exception as pd_error:
+                # Fall back to CSVLoader if pandas fails
+                loader = CSVLoader(str(file_path))
+                docs = loader.load()
+                return {"texts": docs, "tables": [], "images": []}
+                
+        except Exception as e:
+            print(f"Error processing CSV file {file_path}: {e}")
+            return {"texts": [], "tables": [], "images": []}
+    
+    def _process_text(self, file_path: Path) -> Dict[str, List[Document]]:
+        """Process a plain text file.
+        
+        Args:
+            file_path: Path to the text file
+            
+        Returns:
+            Dictionary containing 'texts' with file content
+        """
+        try:
+            loader = TextLoader(str(file_path))
+            docs = loader.load()
+            return {"texts": docs, "tables": [], "images": []}
+        except Exception as e:
+            print(f"Error processing text file {file_path}: {e}")
             return {"texts": [], "tables": [], "images": []}
     
     def _process_pdf(

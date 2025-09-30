@@ -16,7 +16,7 @@ google-cloud-storage>=2.10.0
 # Document Processing
 pypdf>=3.17.0
 pytesseract>=0.3.10
-unstructured[all-docs]>=0.11.0
+unstructured[all-docs,docx,ppt,pptx,xlsx]>=0.11.0
 lxml>=4.9.0
 python-docx>=0.8.11
 python-pptx>=0.6.21
@@ -41,6 +41,7 @@ uvicorn>=0.22.0
 python-multipart>=0.0.6
 python-jose[cryptography]>=3.3.0
 passlib[bcrypt]>=1.7.4
+streamlit>=1.28.0
 
 # Development & Testing
 pytest>=7.3.1

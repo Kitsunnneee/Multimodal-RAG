@@ -3,6 +3,10 @@ Streamlit UI for Multimodal RAG System with Mem0 Memory
 """
 import os
 import tempfile
+import logging
+
+# Set up logging
+logger = logging.getLogger(__name__)
 import streamlit as st
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -66,47 +70,90 @@ with st.sidebar:
     # Initialize/Reset button
     if st.button("Initialize/Reset System"):
         with st.spinner("Initializing RAG system..."):
-            st.session_state.rag_system = MultimodalRAG(
-                model_name=model_name,
-                token_limit=TOKEN_LIMIT
-            )
-            
-            if use_memory:
-                try:
-                    st.session_state.memory_manager = MemoryManager(
-                        collection_name=memory_collection,
-                        use_hosted=False,  # Set to True if using hosted Mem0
-                        user_id=user_id  # Use the user-provided user_id
-                    )
-                    st.success("✓ Memory manager initialized!")
-                except Exception as e:
-                    st.warning(f"⚠ Memory manager initialization failed: {e}")
-                    st.info("Continuing without memory functionality.")
-                    st.session_state.memory_manager = None
-            
-            # Initialize audio processor components
-            if not st.session_state.audio_processor_initialized:
-                with st.spinner("Initializing audio processor..."):
-                    try:
-                        initialize_components()
-                        st.session_state.audio_processor_initialized = True
-                        st.success("✓ Audio processor initialized!")
-                    except Exception as e:
-                        st.warning(f"⚠ Audio processor initialization failed: {e}")
-                        st.info("Audio files will still be uploaded but transcription may not work.")
-            
-            # Initialize video processor components
-            if not st.session_state.video_processor_initialized:
-                with st.spinner("Initializing video processor..."):
-                    try:
-                        initialize_video_components()
-                        st.session_state.video_processor_initialized = True
-                        st.success("✓ Video processor initialized!")
-                    except Exception as e:
-                        st.warning(f"⚠ Video processor initialization failed: {e}")
-                        st.info("Video files will still be uploaded but processing may not work.")
-            
-            st.success("RAG system initialized successfully!")
+            try:
+                # Initialize RAG system
+                st.session_state.rag_system = MultimodalRAG(
+                    model_name=model_name,
+                    token_limit=TOKEN_LIMIT
+                )
+                
+                # Initialize memory manager if enabled
+                if use_memory:
+                    # Try MEM0 first if API key is available
+                    mem0_api_key = os.environ.get("MEM0_API_KEY")
+                    if mem0_api_key:
+                        try:
+                            from mem0 import MemoryClient
+                            st.session_state.memory_manager = MemoryClient(api_key=mem0_api_key)
+                            
+                            # Store user ID in session state
+                            st.session_state.user_id = user_id or "default_user"
+                            
+                            # Test the connection
+                            test_result = st.session_state.memory_manager.add(
+                                messages=[{"role": "system", "content": "Memory initialized successfully"}],
+                                user_id=st.session_state.user_id
+                            )
+                            
+                            if test_result is not None and 'results' in test_result:
+                                st.session_state.memory_initialized = True
+                                logger.info("Memory system initialized successfully with MEM0")
+                                st.success("✓ Memory system initialized (MEM0)")
+                            else:
+                                logger.warning("MEM0 test returned unexpected response, falling back to local memory")
+                                st.session_state.memory_manager = MemoryManager(
+                                    collection_name=memory_collection,
+                                    use_hosted=False,
+                                    user_id=user_id
+                                )
+                                st.success("✓ Memory system initialized (Local)")
+                                
+                        except ImportError:
+                            logger.warning("MEM0 package not available, falling back to local memory")
+                            st.session_state.memory_manager = MemoryManager(
+                                collection_name=memory_collection,
+                                use_hosted=False,
+                                user_id=user_id
+                            )
+                            st.success("✓ Memory system initialized (Local)")
+                    else:
+                        # Use local memory manager if MEM0_API_KEY not set
+                        st.session_state.memory_manager = MemoryManager(
+                            collection_name=memory_collection,
+                            use_hosted=False,
+                            user_id=user_id
+                        )
+                        st.success("✓ Memory system initialized (Local)")
+                
+                # Initialize audio processor components
+                if not st.session_state.audio_processor_initialized:
+                    with st.spinner("Initializing audio processor..."):
+                        try:
+                            initialize_components()
+                            st.session_state.audio_processor_initialized = True
+                            st.success("✓ Audio processor initialized")
+                            logger.info("Audio processor initialized successfully")
+                        except Exception as e:
+                            st.warning(f"⚠ Audio processor initialization failed: {e}")
+                            logger.warning(f"Audio processor initialization failed: {e}")
+                
+                # Initialize video processor components
+                if not st.session_state.video_processor_initialized:
+                    with st.spinner("Initializing video processor..."):
+                        try:
+                            initialize_video_components()
+                            st.session_state.video_processor_initialized = True
+                            st.success("✓ Video processor initialized")
+                            logger.info("Video processor initialized successfully")
+                        except Exception as e:
+                            st.warning(f"⚠ Video processor initialization failed: {e}")
+                            logger.warning(f"Video processor initialization failed: {e}")
+                
+                st.success("✅ RAG system initialized successfully!")
+                
+            except Exception as e:
+                st.error(f"Failed to initialize RAG system: {str(e)}")
+                logger.error(f"RAG system initialization failed: {str(e)}", exc_info=True)
 
 # Main content
 st.title("🤖 Multimodal RAG Chat")
@@ -115,9 +162,36 @@ st.caption("Upload documents and chat with them using the power of multimodal RA
 # File uploader
 st.subheader("📂 Upload Documents, Audio & Video Files")
 uploaded_files = st.file_uploader(
-    "Upload PDFs, images, text files, audio files, or video files",
-    type=["pdf", "png", "jpg", "jpeg", "bmp", "gif", "webp", "tiff", "tif", "txt", "csv", "xlsx", "wav", "mp3", "m4a", "flac", "ogg", "mp4", "avi", "mov", "mkv", "wmv", "flv"],
-    accept_multiple_files=True
+    "Upload documents, presentations, spreadsheets, images, audio, or video files",
+    type=[
+        # Documents
+        "pdf", "txt", "md", "html", "rtf",
+        # Office Documents
+        "docx", "doc", "odt", "ott",
+        # Spreadsheets
+        "xlsx", "xls", "xlsm", "xlsb", "ods", "ots",
+        # Presentations
+        "pptx", "ppt", "odp", "otp",
+        # Images
+        "png", "jpg", "jpeg", "tiff", "bmp", "gif", "webp",
+        # Audio
+        "wav", "mp3", "m4a", "flac", "ogg",
+        # Video
+        "mp4", "avi", "mov", "mkv", "wmv", "flv",
+        # Data
+        "csv", "tsv", "json", "xml", "yaml", "yml"
+    ],
+    accept_multiple_files=True,
+    help="""
+    Supported formats:
+    - Documents: PDF, TXT, MD, HTML, DOCX, DOC, ODT
+    - Spreadsheets: XLSX, XLS, XLSM, ODS
+    - Presentations: PPTX, PPT, ODP
+    - Images: PNG, JPG, JPEG, TIFF, BMP, GIF, WEBP
+    - Audio: WAV, MP3, M4A, FLAC, OGG
+    - Video: MP4, AVI, MOV, MKV, WMV, FLV
+    - Data: CSV, TSV, JSON, XML, YAML
+    """
 )
 
 # Process uploaded files
@@ -163,7 +237,6 @@ if uploaded_files and st.button("Process Documents, Audio & Video"):
                                 st.write(f"💾 Stored transcription for {uploaded_file.name}")
                                 
                                 # Add transcription as a document to the RAG system
-                                # Create a temporary text file with the transcription
                                 transcript_path = temp_dir / f"{uploaded_file.name}_transcript.txt"
                                 with open(transcript_path, "w") as tf:
                                     tf.write(f"Audio transcription from {uploaded_file.name}:\n\n{transcription}")
@@ -471,12 +544,59 @@ if st.session_state.video_analyses:
                         st.success("✓ Video analysis complete!")
                         st.write("💬 **Response:**")
                         st.write(response["answer"])
+                        
+                        # Store the analysis in session state
+                        if "video_analyses" not in st.session_state:
+                            st.session_state.video_analyses = {}
+                        st.session_state.video_analyses[selected_video] = {
+                            "analysis": response["answer"],
+                            "file_type": st.session_state.video_analyses[selected_video]["file_type"],
+                            "timestamp": datetime.now().isoformat()
+                        }
+                        
                     except Exception as e:
                         st.error(f"Error analyzing video: {e}")
             else:
                 st.warning("Please enter a query about the video.")
+            
+            st.divider()
+            
+            status_text.empty()
+            progress_bar.empty()
+            
+            if processed_count > 0:
+                st.success(f"Successfully processed {processed_count} out of {len(uploaded_files)} documents!")
+            else:
+                st.warning("No documents were processed successfully. Please check the error messages above.")
+
+# Display uploaded files
+if st.session_state.uploaded_files:
+    st.subheader("📝 Uploaded Documents")
     
-    st.divider()
+    # Create a table for better organization
+    cols = st.columns([4, 2, 2, 2])
+    with cols[0]: st.markdown("**File Name**")
+    with cols[1]: st.markdown("**Type**")
+    with cols[2]: st.markdown("**Size**")
+    with cols[3]: st.markdown("**Chunks**")
+    
+    for file_info in st.session_state.uploaded_files:
+        cols = st.columns([4, 2, 2, 2])
+        with cols[0]: st.text(file_info['name'])
+        with cols[1]: st.text(file_info['type'].split('/')[-1].upper())
+        with cols[2]: st.text(f"{file_info['size']/1024:.1f} KB")
+        with cols[3]: st.text(file_info.get('chunks', 'N/A'))
+    
+    # Add a button to clear all uploaded files
+    if st.button("Clear All Documents", type="secondary"):
+        st.session_state.uploaded_files = []
+        st.session_state.chat_history = []
+        # Clear audio and video states as well
+        if 'audio_transcriptions' in st.session_state:
+            st.session_state.audio_transcriptions = {}
+        if 'video_analyses' in st.session_state:
+            st.session_state.video_analyses = {}
+        st.rerun()
 
 # Chat interface
 st.subheader("💬 Chat with your documents, audio & video")
@@ -545,10 +665,15 @@ for msg_idx, message in enumerate(st.session_state.chat_history):
                                 source_path = Path(citation['source'])
                                 if source_path.exists():
                                     with open(source_path, "rb") as f:
+                                        # Create a unique key for each download button using file name, index, and timestamp
+                                        import time
+                                        timestamp = int(time.time() * 1000)  # Current time in milliseconds
+                                        button_key = f"download_{source_path.stem}_{i}_{timestamp}"
                                         st.download_button(
                                             label="View Source",
                                             data=f,
                                             file_name=source_path.name,
+                                            key=button_key,
                                             mime="application/octet-stream",
                                             use_container_width=True,
                                             key=f"download_btn_{msg_idx}_{i}_{source_path.name}"
@@ -631,8 +756,8 @@ if prompt := st.chat_input(chat_placeholder):
                         return_context=True
                     )
                     
-                    # Display response
-                    st.write(response["answer"])
+                    # Create a placeholder for the response
+                    response_placeholder = st.empty()
                     
                     # Format citations for display
                     formatted_citations = []
@@ -641,45 +766,125 @@ if prompt := st.chat_input(chat_placeholder):
                             "type": citation.get("type", "text"),
                             "display_text": citation.get("display_text", ""),
                             "source": citation.get("source", ""),
-                            "page": citation.get("page", "")
+                            "page": citation.get("page", ""),
+                            "content": citation.get("content", ""),
+                            "image_path": citation.get("image_path", "")
                         }
-                        
-                        # Add type-specific fields
-                        if formatted_citation["type"] == "image":
-                            formatted_citation["image_path"] = citation.get("image_path", "")
-                        else:
-                            formatted_citation["content"] = citation.get("content", "")
-                        
                         formatted_citations.append(formatted_citation)
                     
                     # Add to chat history with formatted citations
-                    st.session_state.chat_history.append({
+                    assistant_message = {
                         "role": "assistant",
                         "content": response["answer"],
-                        "citations": formatted_citations
-                    })
+                        "citations": formatted_citations,
+                        "timestamp": time.time()
+                    }
+                    st.session_state.chat_history.append(assistant_message)
+                    
+                    # Display the response with citations
+                    with response_placeholder.container():
+                        st.write(response["answer"])
+                        
+                        # Display citations if available
+                        if formatted_citations:
+                            with st.expander(f"📚 Sources ({len(formatted_citations)})", expanded=True):
+                                for i, citation in enumerate(formatted_citations, 1):
+                                    with st.container():
+                                        st.markdown(f"### Source {i}")
+                                        
+                                        # Display source information
+                                        col1, col2 = st.columns([1, 3])
+                                        
+                                        with col1:
+                                            # Show icon based on source type
+                                            if citation.get('type') == 'image':
+                                                st.markdown("🖼️ **Image Source")
+                                                if citation.get('image_path'):
+                                                    try:
+                                                        st.image(citation['image_path'], use_column_width=True)
+                                                    except Exception as e:
+                                                        st.warning("Could not load image")
+                                            else:
+                                                st.markdown("📄 **Text Source")
+                                        
+                                        with col2:
+                                            # Display source metadata
+                                            if citation.get('display_text'):
+                                                st.markdown(f"**{citation['display_text']}**")
+                                            
+                                            # Show content preview for text sources
+                                            if citation.get('content'):
+                                                with st.expander("View content"):
+                                                    st.markdown(citation['content'])
+                                            
+                                            # Add a download/view button for the source
+                                            if citation.get('source'):
+                                                source_path = Path(citation['source'])
+                                                if source_path.exists():
+                                                    with open(source_path, "rb") as f:
+                                                        button_key = f"download_{source_path.stem}_{i}_{int(time.time()*1000)}"
+                                                        st.download_button(
+                                                            label="View Source",
+                                                            data=f,
+                                                            file_name=source_path.name,
+                                                            key=button_key,
+                                                            use_container_width=True
+                                                        )
                     
                     # Update memory if enabled
                     if use_memory and st.session_state.memory_manager:
                         try:
                             # Combine user input and AI response for memory
                             memory_content = f"User: {prompt}\nAssistant: {response['answer']}"
-                            result = st.session_state.memory_manager.add_memory(
-                                content=memory_content,
-                                metadata={
-                                    "source": "chat",
-                                    "citations": response.get("citations", []),
-                                    "user_input": prompt,
-                                    "ai_response": response["answer"]
-                                }
-                            )
+                            
+                            # Try MEM0 first if available
+                            if hasattr(st.session_state.memory_manager, 'add'):
+                                result = st.session_state.memory_manager.add(
+                                    messages=[
+                                        {"role": "user", "content": prompt},
+                                        {"role": "assistant", "content": response['answer']}
+                                    ],
+                                    user_id=st.session_state.user_id,
+                                    metadata={
+                                        "source": "chat",
+                                        "citations": response.get("citations", [])
+                                    }
+                                )
+                            else:
+                                # Fallback to local memory manager
+                                result = st.session_state.memory_manager.add_memory(
+                                    content=memory_content,
+                                    metadata={
+                                        "source": "chat",
+                                        "citations": response.get("citations", []),
+                                        "user_input": prompt,
+                                        "ai_response": response["answer"]
+                                    }
+                                )
+                            
                             if result:
                                 st.success("✓ Conversation saved to memory", icon="🧠")
+                                # Log successful addition
+                                if hasattr(st.session_state.memory_manager, 'add'):  # MEM0
+                                    if isinstance(result, dict) and 'results' in result and isinstance(result['results'], list):
+                                        logger.info(f"Successfully added to memory. Result: {len(result['results'])} items")
+                                    else:
+                                        logger.warning(f"MEM0 returned unexpected response format: {result}")
+                                else:  # Local memory manager
+                                    logger.info("Successfully added to local memory")
                         except Exception as mem_error:
-                            st.warning(f"⚠ Could not save to memory: {str(mem_error)[:100]}...")
-                    
+                            error_msg = str(mem_error)
+                            logger.error(f"Error saving to memory: {error_msg}", exc_info=True)
+                            st.warning(f"⚠ Could not save to memory: {error_msg[:100]}...")
+                        except Exception as e:
+                            error_msg = f"Failed to handle memory: {str(e)}"
+                            logger.error(error_msg, exc_info=True)
+                            st.warning("Failed to save conversation to memory")
+                
                 except Exception as e:
-                    st.error(f"Error generating response: {str(e)}")
+                    error_msg = f"Error generating response: {str(e)}"
+                    logger.error(error_msg, exc_info=True)
+                    st.error("An error occurred while generating the response. Please try again.")
 
 # Add some CSS for better styling
 st.markdown("""
